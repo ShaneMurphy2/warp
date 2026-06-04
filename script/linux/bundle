@@ -27,6 +27,7 @@ BUILD="true"
 BUILD_ARCH="$(uname -m)"
 DEBUG=false
 ARTIFACT="app"
+NO_NLD=false
 
 # Cache all params so we can pass them to downstream scripts.
 ALL_PARAMS=$@
@@ -87,6 +88,11 @@ while (( "$#" )); do
         echo "Error: Argument for $1 is missing" >&2
         exit 1
       fi
+      ;;
+    --no-nld)
+      echo "Skipping natural language detection features."
+      NO_NLD=true
+      shift
       ;;
     --arch)
       if [ -n "$2" ]; then
@@ -196,10 +202,12 @@ if [[ "$ARTIFACT" == "cli" ]]; then
   FEATURES="$FEATURES,standalone"
 elif [[ "$ARTIFACT" == "app" ]]; then
   FEATURES="$FEATURES,gui"
-  if [[ "$RELEASE_CHANNEL" == "local" || "$RELEASE_CHANNEL" == "dev" ]]; then
-    FEATURES="$FEATURES,nld_classifier_v2,nld_heuristic_v2"
-  else
-    FEATURES="$FEATURES,nld_classifier_v1,nld_heuristic_v1"
+  if [[ "$NO_NLD" != true ]]; then
+    if [[ "$RELEASE_CHANNEL" == "local" || "$RELEASE_CHANNEL" == "dev" ]]; then
+      FEATURES="$FEATURES,nld_classifier_v2,nld_heuristic_v2"
+    else
+      FEATURES="$FEATURES,nld_classifier_v1,nld_heuristic_v1"
+    fi
   fi
 fi
 

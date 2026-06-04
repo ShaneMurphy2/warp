@@ -2,7 +2,8 @@ BUNDLE_NAME = WarpDockTilePlugin.docktileplugin
 OBJC_FILES = WarpDockTilePlugin.m
 FRAMEWORKS = -framework Cocoa -framework AppKit -framework Foundation
 # Compile a universal binary for both arm64 and x86_64.
-CFLAGS = -fobjc-arc -bundle -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -arch arm64 -arch x86_64
+DOCK_TILE_PLUGIN_ARCH_FLAGS ?= -arch arm64 -arch x86_64
+CFLAGS = -fobjc-arc -bundle -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) $(DOCK_TILE_PLUGIN_ARCH_FLAGS)
 LDFLAGS = -ObjC
 
 .PHONY: all clean
