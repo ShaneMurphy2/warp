@@ -27,6 +27,9 @@ use super::{
     write_temp_file, HarnessRunner, JSONMCPServer, ResumePayload, SavePoint, ThirdPartyHarness,
 };
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent_sdk::setup_observability::{
+    OzRunTimelineEvent, SetupClientEventReporter, SetupStep,
+};
 use crate::ai::ambient_agents::task::HarnessModelConfig;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::mcp::JSONTransportType;
@@ -297,6 +300,7 @@ impl HarnessRunner for CodexHarnessRunner {
     async fn start(
         &self,
         foreground: &ModelSpawner<AgentDriver>,
+        setup_events: &SetupClientEventReporter,
     ) -> Result<CommandHandle, AgentDriverError> {
         // Resume runs reuse the prior server conversation id; fresh runs mint a new one.
         let conversation_id = match self.preexisting_conversation_id {
@@ -305,14 +309,17 @@ impl HarnessRunner for CodexHarnessRunner {
                 id
             }
             None => {
-                let id = self
-                    .client
-                    .create_external_conversation(CODEX_CLI_FORMAT)
-                    .await
-                    .map_err(|e| {
-                        log::error!("Failed to create external conversation: {e}");
-                        AgentDriverError::ConfigBuildFailed(e)
-                    })?;
+                let id = setup_events
+                    .record_result(SetupStep::ThirdPartyHarnessExternalConversation, async {
+                        self.client
+                            .create_external_conversation(CODEX_CLI_FORMAT)
+                            .await
+                            .map_err(|e| {
+                                log::error!("Failed to create external conversation: {e}");
+                                AgentDriverError::ConfigBuildFailed(e)
+                            })
+                    })
+                    .await?;
                 log::info!("Created external conversation {id}");
                 id
             }
@@ -331,6 +338,10 @@ impl HarnessRunner for CodexHarnessRunner {
             conversation_id,
             block_id: command_handle.block_id().clone(),
         };
+
+        setup_events
+            .post_timeline_event(OzRunTimelineEvent::AgentStarted)
+            .await;
 
         Ok(command_handle)
     }

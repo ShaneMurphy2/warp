@@ -37,17 +37,15 @@ use crate::features::FeatureFlag;
 use crate::throttle::throttle;
 #[cfg(feature = "local_fs")]
 use crate::util::git::get_all_branches;
-#[cfg(feature = "local_fs")]
-use crate::util::git::get_pr_for_branch;
 use crate::util::git::{
     detect_current_branch, detect_main_branch, get_unpushed_commits, parse_unified_diff_header,
-    Commit, PrInfo,
+    Commit,
 };
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
         use std::collections::HashSet;
-        use crate::code_review::file_invalidation_queue::{FileInvalidationError, FileInvalidationTask};
+        use crate::code_review::file_invalidation_queue::FileInvalidationTask;
         use repo_metadata::repositories::{DetectedRepositories, RepoDetectionSource};
         use repo_metadata::{
             repository::{RepositorySubscriber, SubscriberId},
@@ -57,13 +55,13 @@ cfg_if::cfg_if! {
         use warpui::{ModelHandle, SingletonEntity};
     }
 }
+#[cfg(feature = "local_fs")]
+use super::DiffOperation;
 use super::{
-    DiffHunk, DiffLine, DiffLineType, DiffMetadata, DiffMetadataAgainstBase, DiffMode, DiffState,
-    DiffStateModelEvent, DiffStats, FileDiff, FileDiffAndContent, FileStatusInfo, GitDiffData,
-    GitDiffWithBaseContent, GitFileStatus,
+    BackendOrigin, DiffHunk, DiffLine, DiffLineType, DiffMetadata, DiffMetadataAgainstBase,
+    DiffMode, DiffState, DiffStateError, DiffStateModelEvent, DiffStats, FileDiff,
+    FileDiffAndContent, FileStatusInfo, GitDiffData, GitDiffWithBaseContent, GitFileStatus,
 };
-#[cfg(all(feature = "local_fs", feature = "local_tty"))]
-use crate::terminal::local_shell::LocalShellState;
 
 // Unicode bidirectional characters that should be flagged
 const BIDI_CHARS: [char; 9] = [
@@ -83,6 +81,10 @@ const BIDI_CHARS: [char; 9] = [
 /// and changes against the main branch.
 #[derive(Clone, Default)]
 enum InternalDiffState {
+    /// Repo detection has been kicked off but hasn't completed yet.
+    /// We don't yet know whether the path is inside a git repository, so this is
+    /// surfaced as a loading state rather than a premature "not a repository" verdict.
+    Detecting,
     #[default]
     NotInRepository,
     Loading,
@@ -189,19 +191,13 @@ pub struct LocalDiffStateModel {
     #[cfg(feature = "local_fs")]
     subscriber_id: Option<SubscriberId>,
     state: InternalDiffState,
+    backend_origin: BackendOrigin,
     mode: DiffMode,
     metadata: Option<DiffMetadata>,
     computing_diffs_abort_handle: Option<SpawnedFutureHandle>,
     computing_metadata_abort_handle: Option<SpawnedFutureHandle>,
-    refreshing_pr_info_handle: Option<SpawnedFutureHandle>,
     /// Start time for the latest caller-tracked full diff load.
     tracked_diff_load_start_time: Option<Instant>,
-    /// Branch name for which `refresh_pr_info` has been called at least once.
-    /// Gates the metadata-refresh fallback so it only retries `gh pr view` once
-    /// per branch when `pr_info` is `None` (e.g. branch has no PR, lookup
-    /// failed). Without this, every filesystem event on the repo would re-fire
-    /// `gh pr view` for branches that legitimately have no PR.
-    pr_info_attempted_for_branch: Option<String>,
     /// Controls whether periodic throttled metadata refresh is active.
     /// Refresh is suppressed when the code review pane is not open.
     metadata_refresh_enabled: bool,
@@ -223,7 +219,11 @@ struct GitNumStatMetadata {
 
 impl LocalDiffStateModel {
     #[cfg(feature = "local_fs")]
-    pub fn new(repo_path: Option<String>, ctx: &mut ModelContext<Self>) -> Self {
+    pub fn new(
+        repo_path: Option<String>,
+        backend_origin: BackendOrigin,
+        ctx: &mut ModelContext<Self>,
+    ) -> Self {
         // Set up file invalidation queue and subscribe to results
         // so the model can emit SingleFileUpdated events.
         let queue = SyncQueue::new_streaming(&ctx.background_executor());
@@ -231,7 +231,7 @@ impl LocalDiffStateModel {
 
         ctx.spawn_stream_local(
             rx,
-            |me, broadcast_result: Result<_, Arc<FileInvalidationError>>, ctx| {
+            |me, broadcast_result: Result<_, Arc<DiffStateError>>, ctx| {
                 if me.file_invalidation.invalidate_all_pending {
                     return;
                 }
@@ -248,10 +248,11 @@ impl LocalDiffStateModel {
                         ctx.emit(DiffStateModelEvent::SingleFileUpdated { path, diff });
                     }
                     Err(err) => {
-                        log::error!("File invalidation error: {err}");
+                        warp_core::report_error!(err.as_ref());
                         send_telemetry_from_ctx!(
                             CodeReviewTelemetryEvent::LoadDiffFailed {
-                                is_local: Some(true),
+                                backend_origin: me.backend_origin,
+                                operation: DiffOperation::FileInvalidation,
                                 mode: me.mode.clone(),
                                 error: err.to_string(),
                                 // Per-file invalidation errors are not tied to a full
@@ -268,15 +269,18 @@ impl LocalDiffStateModel {
 
         let model = Self {
             repository: None,
-            state: InternalDiffState::default(),
+            state: if repo_path.is_some() {
+                InternalDiffState::Detecting
+            } else {
+                InternalDiffState::NotInRepository
+            },
             subscriber_id: None,
             mode: DiffMode::default(),
+            backend_origin,
             metadata: None,
             computing_diffs_abort_handle: None,
             computing_metadata_abort_handle: None,
-            refreshing_pr_info_handle: None,
             tracked_diff_load_start_time: None,
-            pr_info_attempted_for_branch: None,
             metadata_refresh_enabled: false,
             file_invalidation: FileInvalidationState::new(queue),
             pending_file_updates: None,
@@ -303,6 +307,7 @@ impl LocalDiffStateModel {
                 // Repo detection completed but found no repository.
                 // Emit so subscribers (e.g. the server model) can drain
                 // pending responses with the NotInRepository state.
+                me.state = InternalDiffState::NotInRepository;
                 me.tracked_diff_load_start_time = None;
                 ctx.emit(DiffStateModelEvent::NewDiffsComputed {
                     diffs: None,
@@ -314,24 +319,27 @@ impl LocalDiffStateModel {
     }
 
     #[cfg(not(feature = "local_fs"))]
-    pub fn new(_repo_path: Option<String>, _ctx: &mut ModelContext<Self>) -> Self {
+    pub fn new(
+        _repo_path: Option<String>,
+        backend_origin: BackendOrigin,
+        _ctx: &mut ModelContext<Self>,
+    ) -> Self {
         Self {
             state: InternalDiffState::default(),
+            backend_origin,
             mode: DiffMode::default(),
             metadata: None,
             computing_diffs_abort_handle: None,
             computing_metadata_abort_handle: None,
-            refreshing_pr_info_handle: None,
             tracked_diff_load_start_time: None,
-            pr_info_attempted_for_branch: None,
             metadata_refresh_enabled: false,
         }
     }
 
     pub fn get(&self) -> DiffState {
         match &self.state {
+            InternalDiffState::Detecting | InternalDiffState::Loading => DiffState::Loading,
             InternalDiffState::NotInRepository => DiffState::NotInRepository,
-            InternalDiffState::Loading => DiffState::Loading,
             InternalDiffState::Loaded(diffs) => match &diffs.changes {
                 Ok(_) => DiffState::Loaded,
                 Err(err) => DiffState::Error(err.clone()),
@@ -402,18 +410,6 @@ impl LocalDiffStateModel {
             (Some(upstream), Some(main)) => upstream != main,
             _ => false,
         }
-    }
-
-    /// The PR info for the current branch, if one exists.
-    pub fn pr_info(&self) -> Option<&PrInfo> {
-        self.metadata
-            .as_ref()
-            .and_then(|metadata| metadata.pr_info.as_ref())
-    }
-
-    /// Whether PR info for the current branch is currently being refreshed.
-    pub fn is_pr_info_refreshing(&self) -> bool {
-        self.refreshing_pr_info_handle.is_some()
     }
 
     /// Checks if git operations like stash or reset would be blocked due to repository state.
@@ -1212,13 +1208,12 @@ impl LocalDiffStateModel {
         }
     }
 
-    /// Refreshes metadata and PR info after a git operation (commit, push,
-    /// create PR). Does NOT reload diffs — for commits the file watcher
-    /// triggers that via `commit_updated`, and for push/create-PR the
-    /// working directory hasn't changed so the loaded diffs are still valid.
-    pub fn refresh_metadata_and_pr_info(&mut self, ctx: &mut ModelContext<Self>) {
+    /// Refreshes metadata after a git operation (commit, push, create PR).
+    /// Does NOT reload diffs — for commits the file watcher triggers that via
+    /// `commit_updated`, and for push/create-PR the working directory hasn't
+    /// changed so the loaded diffs are still valid.
+    pub fn refresh_metadata_after_git_operation(&mut self, ctx: &mut ModelContext<Self>) {
         self.refresh_diff_metadata_for_current_repo(false, ctx);
-        self.refresh_pr_info(ctx);
     }
 
     #[cfg(feature = "local_fs")]
@@ -1415,25 +1410,19 @@ impl LocalDiffStateModel {
             .metadata
             .as_ref()
             .map(|metadata| metadata.current_branch_name.clone());
-        let previous_pr_info = self
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.pr_info.clone());
 
         match metadata {
-            Ok(mut metadata) => {
-                // Carry forward cached PR info while refresh_pr_info is pending
-                // so the header doesn't flash to Commit/Create PR between
-                // branch switch and PR lookup completion.
-                metadata.pr_info = previous_pr_info;
+            Ok(metadata) => {
                 self.metadata = Some(metadata);
             }
             Err(e) => {
+                let err = DiffStateError::from(e);
+                warp_core::report_error!(&err);
                 send_telemetry_from_ctx!(
                     CodeReviewTelemetryEvent::LoadMetadataFailed {
-                        is_local: Some(true),
+                        backend_origin: self.backend_origin,
                         mode: self.mode.clone(),
-                        error: e.to_string(),
+                        error: err.to_string(),
                     },
                     ctx
                 );
@@ -1448,29 +1437,13 @@ impl LocalDiffStateModel {
 
         if previous_branch != current_branch {
             ctx.emit(DiffStateModelEvent::CurrentBranchChanged);
-
-            // Refresh PR info on branch change (network call, not on every tick).
-            if FeatureFlag::GitOperationsInCodeReview.is_enabled() {
-                self.refresh_pr_info(ctx);
-            }
-        } else if FeatureFlag::GitOperationsInCodeReview.is_enabled()
-            && self.pr_info().is_none()
-            && !self.is_pr_info_refreshing()
-            && self.pr_info_attempted_for_branch != current_branch
-        {
-            // Initial-load fallback: if metadata arrived without a successful
-            // PR lookup yet on this branch, try once. Gated by
-            // `pr_info_attempted_for_branch` so subsequent metadata refreshes
-            // (every fs event on the repo) don't re-fire `gh pr view` when the
-            // branch has no PR or the lookup failed.
-            self.refresh_pr_info(ctx);
         }
 
         if should_reload_diffs {
             self.load_diffs_for_current_repo(false, false, ctx);
         }
         if let Some(metadata) = self.metadata.clone() {
-            ctx.emit(DiffStateModelEvent::MetadataRefreshed(metadata));
+            ctx.emit(DiffStateModelEvent::MetadataRefreshed(Box::new(metadata)));
         }
     }
 
@@ -1490,11 +1463,14 @@ impl LocalDiffStateModel {
                     .tracked_diff_load_start_time
                     .take()
                     .map(|start| start.elapsed());
+                let err = DiffStateError::from_message(e);
+                warp_core::report_error!(&err);
                 send_telemetry_from_ctx!(
                     CodeReviewTelemetryEvent::LoadDiffFailed {
-                        is_local: Some(true),
+                        backend_origin: self.backend_origin,
+                        operation: DiffOperation::DiffLoad,
                         mode: self.mode.clone(),
-                        error: e.to_string(),
+                        error: err.to_string(),
                         load_duration,
                     },
                     ctx
@@ -2633,52 +2609,6 @@ pub(crate) async fn diff_metadata_against_head(
     })
 }
 
-impl LocalDiffStateModel {
-    /// Fetches PR info for the current branch via `gh pr view` (network call).
-    /// Call this on branch change or after push — not on every metadata refresh.
-    #[cfg(feature = "local_fs")]
-    pub fn refresh_pr_info(&mut self, ctx: &mut ModelContext<Self>) {
-        if let Some(handle) = self.refreshing_pr_info_handle.take() {
-            handle.abort();
-        }
-        let Some(repo_path) = self.active_repository_path(ctx) else {
-            return;
-        };
-        // Mark this branch as attempted before spawning so the fallback in
-        // `handle_updated_metadata_for_repo` won't re-fire while the lookup
-        // is in flight or after it completes with no PR.
-        self.pr_info_attempted_for_branch = self.get_current_branch_name();
-        #[cfg(feature = "local_tty")]
-        let path_future = LocalShellState::handle(ctx).update(ctx, |shell_state, ctx| {
-            shell_state.get_interactive_path_env_var(ctx)
-        });
-        #[cfg(not(feature = "local_tty"))]
-        let path_future: futures::future::BoxFuture<'static, Option<String>> = {
-            use futures::FutureExt;
-            futures::future::ready(None).boxed()
-        };
-        let handle = ctx.spawn(
-            async move {
-                let path_env = path_future.await;
-                get_pr_for_branch(&repo_path, path_env.as_deref())
-                    .await
-                    .unwrap_or(None)
-            },
-            |me, pr_info, ctx| {
-                me.refreshing_pr_info_handle = None;
-                if let Some(metadata) = &mut me.metadata {
-                    metadata.pr_info = pr_info;
-                    ctx.emit(DiffStateModelEvent::MetadataRefreshed(metadata.clone()));
-                }
-            },
-        );
-        self.refreshing_pr_info_handle = Some(handle);
-    }
-
-    #[cfg(not(feature = "local_fs"))]
-    pub fn refresh_pr_info(&mut self, _ctx: &mut ModelContext<Self>) {}
-}
-
 impl warpui::Entity for LocalDiffStateModel {
     type Event = DiffStateModelEvent;
 }
@@ -2745,13 +2675,12 @@ impl LocalDiffStateModel {
             state: InternalDiffState::default(),
             #[cfg(feature = "local_fs")]
             subscriber_id: None,
+            backend_origin: BackendOrigin::ClientLocal,
             mode: DiffMode::default(),
             metadata: None,
             computing_diffs_abort_handle: None,
             computing_metadata_abort_handle: None,
-            refreshing_pr_info_handle: None,
             tracked_diff_load_start_time: None,
-            pr_info_attempted_for_branch: None,
             metadata_refresh_enabled: false,
             #[cfg(feature = "local_fs")]
             file_invalidation: FileInvalidationState::new(SyncQueue::new_streaming(

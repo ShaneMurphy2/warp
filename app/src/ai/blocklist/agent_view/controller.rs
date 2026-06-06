@@ -178,6 +178,10 @@ pub enum AgentViewEntryOrigin {
     /// Entered agent view by clearing the buffer (Cmd+K) while already in agent view.
     ClearBuffer,
 
+    /// Entered agent view via the "Jump to Latest Agent Message" command, which
+    /// returns to the most recent conversation from the terminal.
+    JumpToLatestAgentMessage,
+
     // The variants below actually correspond to callsites where the selected conversation is
     // updated, but don't actually correspond to entering the agent view. They exist so we can
     // continue to call `set_pending_query_state_for_(new|existing)_conversation`, but you'll find
@@ -783,11 +787,8 @@ impl AgentViewController {
             });
             (id, 0)
         };
-        // Non-transferring: don't rip the conversation out of another terminal
-        // view's live list (e.g. a child agent's hidden pane). Explicit
-        // cross-view ownership transfer is handled by callers elsewhere.
         history_model.update(ctx, |history_model, ctx| {
-            history_model.mark_active_conversation_id(conversation_id, self.terminal_view_id, ctx)
+            history_model.set_active_conversation_id(conversation_id, self.terminal_view_id, ctx)
         });
 
         self.agent_view_state = AgentViewState::Active {
