@@ -253,6 +253,16 @@ pub struct BlockList {
     /// The current block list selection.
     /// Do not set this value directly - use [`Self::set_selection`] and [`Self::clear_selection`] instead.
     selection: Option<BlockListSelection>,
+    /// View IDs of rich content (AI) blocks that currently have an active text
+    /// selection managed by the block itself, rather than by the point-based
+    /// [`selection`](Self::selection) above. Rich content blocks render their own
+    /// selections, so the block list can't derive this from `selection`; the
+    /// terminal view keeps this in sync (see
+    /// [`set_rich_content_selection`](Self::set_rich_content_selection) /
+    /// [`clear_rich_content_selection`](Self::clear_rich_content_selection)) so
+    /// copy/insert paths can find the selected text via
+    /// [`rich_content_blocks_in_selection`](Self::rich_content_blocks_in_selection).
+    rich_content_selections: Vec<EntityId>,
     /// If this is Some, and if smart-select is enabled, double-clicking within this range will
     /// select this range instead of the normal smart-select logic. The purpose of this is to
     /// allow double-click selection to work on the TerminalView::highlighted_link even when it
@@ -629,6 +639,7 @@ impl BlockList {
             max_grid_size_limit: sizes.max_block_scroll_limit,
             event_proxy: event_proxy.clone(),
             selection: None,
+            rich_content_selections: Vec::new(),
             smart_select_override: None,
             bootstrap_stage,
             padding: sizes.block_padding,
@@ -1491,6 +1502,44 @@ impl BlockList {
             }
 
             indices_to_remove.push(index);
+        }
+
+        if indices_to_remove.is_empty() {
+            return;
+        }
+
+        self.clear_selection();
+        self.clear_smart_select_override();
+        self.clear_scroll_position_before_filter();
+
+        // Remove in reverse order so indices remain valid.
+        for index in indices_to_remove.into_iter().rev() {
+            self.remove_block_at_index(index);
+        }
+
+        // Force a re-draw since the blocklist has changed.
+        self.event_proxy.send_wakeup_event();
+    }
+
+    pub fn remove_command_blocks_for_conversation(&mut self, conversation_id: AIConversationId) {
+        let active_block_index = self.active_block_index();
+
+        let mut indices_to_remove = Vec::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            let index: BlockIndex = i.into();
+            if index == active_block_index {
+                continue;
+            }
+
+            if matches!(
+                block.agent_view_visibility(),
+                AgentViewVisibility::Agent {
+                    origin_conversation_id,
+                    ..
+                } if *origin_conversation_id == conversation_id
+            ) {
+                indices_to_remove.push(index);
+            }
         }
 
         if indices_to_remove.is_empty() {
@@ -2702,6 +2751,8 @@ impl BlockList {
                 .flatten(),
             None,
         );
+
+        self.active_block_mut().disable_reset_grid_checks();
     }
 
     /// Splice a background block into the blocklist. This is called once the
@@ -2937,7 +2988,10 @@ impl BlockList {
 
         if block.did_execute {
             let command = self.active_block_mut().command_to_string();
-            self.preexec(PreexecValue { command });
+            self.preexec(PreexecValue {
+                command,
+                session_id: None,
+            });
         }
 
         if block.did_execute || block.is_background {
@@ -3684,6 +3738,10 @@ impl ansi::Handler for BlockList {
         self.latest_block_finished_time = Some(instant::SystemTime::now());
     }
 
+    fn set_current_working_directory(&mut self, path: String) {
+        delegate_to_block!(self.set_current_working_directory(path));
+    }
+
     /// Receives metadata for the prompt and the next command, and
     /// responsible for sending the `AfterBlockCompleted` event to
     /// the view. This is where we want to perform any costly
@@ -3772,7 +3830,7 @@ impl ansi::Handler for BlockList {
     }
 
     fn handle_completed_iterm_image(&mut self, image: ITermImage) {
-        delegate_to_block!(self.handle_completed_iterm_image(image))
+        delegate!(self.handle_completed_iterm_image(image))
     }
 
     fn handle_completed_kitty_action(
@@ -3780,7 +3838,7 @@ impl ansi::Handler for BlockList {
         action: KittyAction,
         metadata: &mut HashMap<u32, StoredImageMetadata>,
     ) -> Option<KittyResponse> {
-        delegate_to_block!(self.handle_completed_kitty_action(action, metadata))
+        delegate!(self.handle_completed_kitty_action(action, metadata))
     }
 
     fn set_keyboard_enhancement_flags(

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 
 use super::env_var_collection_search_item::EnvVarCollectionSearchItem;
 use super::notebook_search_item::NotebookSearchItem;
@@ -66,6 +66,7 @@ impl DataSource {
 
     fn handle_cloud_object_updated(
         &mut self,
+        _: ModelHandle<CloudModel>,
         event: &CloudModelEvent,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -164,9 +165,8 @@ impl crate::search::mixer::SyncDataSource for DataSource {
                 self.searcher
                     .search_notebook(&query.text.to_lowercase(), app)
                     .map_err(|err| {
-                        Box::new(DataSourceSearchError {
-                            message: err.to_string(),
-                        }) as DataSourceRunErrorWrapper
+                        Box::new(DataSourceSearchError::new(err.to_string()))
+                            as DataSourceRunErrorWrapper
                     })?
                     .into_iter()
                     .map(QueryResult::from),
@@ -178,9 +178,8 @@ impl crate::search::mixer::SyncDataSource for DataSource {
                 self.searcher
                     .search_plans(&query.text.to_lowercase(), app)
                     .map_err(|err| {
-                        Box::new(DataSourceSearchError {
-                            message: err.to_string(),
-                        }) as DataSourceRunErrorWrapper
+                        Box::new(DataSourceSearchError::new(err.to_string()))
+                            as DataSourceRunErrorWrapper
                     })?
                     .into_iter()
                     .map(QueryResult::from),
@@ -203,9 +202,8 @@ impl crate::search::mixer::SyncDataSource for DataSource {
                     app,
                 )
                 .map_err(|err| {
-                    Box::new(DataSourceSearchError {
-                        message: err.to_string(),
-                    }) as DataSourceRunErrorWrapper
+                    Box::new(DataSourceSearchError::new(err.to_string()))
+                        as DataSourceRunErrorWrapper
                 })?
                 .into_iter()
                 .map(QueryResult::from),
@@ -219,9 +217,8 @@ impl crate::search::mixer::SyncDataSource for DataSource {
                 self.searcher
                     .search_env_var(&query.text.to_lowercase(), app)
                     .map_err(|err| {
-                        Box::new(DataSourceSearchError {
-                            message: err.to_string(),
-                        }) as DataSourceRunErrorWrapper
+                        Box::new(DataSourceSearchError::new(err.to_string()))
+                            as DataSourceRunErrorWrapper
                     })?
                     .into_iter()
                     .map(QueryResult::from),
@@ -545,6 +542,7 @@ mod full_text_searcher {
 
     use fuzzy_match::FuzzyMatchResult;
     use itertools::Itertools;
+    use warp_search_core::define_search_schema;
     use warpui::r#async::executor::Background;
     use warpui::{AppContext, SingletonEntity};
 
@@ -552,7 +550,6 @@ mod full_text_searcher {
     use crate::cloud_object::{
         CloudObject, CloudObjectLocation, GenericStringObjectFormat, JsonObjectType, ObjectType,
     };
-    use crate::define_search_schema;
     use crate::drive::folders::CloudFolder;
     use crate::env_vars::CloudEnvVarCollection;
     use crate::notebooks::manager::NotebookManager;

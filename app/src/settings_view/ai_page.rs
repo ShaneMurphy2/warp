@@ -1,4 +1,7 @@
-use ::ai::api_keys::{ApiKeyManager, ApiKeys};
+use ::ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent, ApiKeys};
+#[cfg(not(target_family = "wasm"))]
+use ::ai::grok_subscription::oauth::{self, ManualCodeExchange};
+use chrono::{DateTime, Local};
 use enum_iterator::all;
 use itertools::Itertools;
 use pathfinder_geometry::vector::vec2f;
@@ -47,8 +50,8 @@ use super::settings_page::{
     HEADER_PADDING, TOGGLE_BUTTON_RIGHT_PADDING,
 };
 use super::{
-    flags, SettingActionPairContexts, SettingActionPairDescriptions, SettingsAction,
-    SettingsSection, ToggleSettingActionPair,
+    editor_text_colors, flags, SettingActionPairContexts, SettingActionPairDescriptions,
+    SettingsAction, SettingsSection, ToggleSettingActionPair,
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::aws_credentials::refresh_aws_credentials;
@@ -60,7 +63,10 @@ use crate::ai::execution_profiles::model_menu_items::available_model_menu_items;
 use crate::ai::execution_profiles::profiles::{
     AIExecutionProfilesModel, AIExecutionProfilesModelEvent, ClientProfileId,
 };
-use crate::ai::execution_profiles::{AIExecutionProfile, ActionPermission, WriteToPtyPermission};
+use crate::ai::execution_profiles::{
+    long_context_pricing_warning_title, AIExecutionProfile, AIExecutionProfileAppExt,
+    ActionPermission, WriteToPtyPermission,
+};
 use crate::ai::llms::{LLMContextWindow, LLMId, LLMPreferences, LLMPreferencesEvent};
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::ai::paths::host_native_absolute_path;
@@ -77,19 +83,24 @@ use crate::settings::{
     AgentModeCodingPermissionsType, AgentModeCommandExecutionDenylist,
     AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled, AwsBedrockAutoLogin,
     AwsBedrockCredentialsEnabled, CanUseWarpCreditsForFallback, CodeSettings,
-    CodebaseContextEnabled, FeedbackBundledSkillEnabled, FileBasedMcpEnabled,
-    GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory, InputSettings,
-    IntelligentAutosuggestionsEnabled, MemoryEnabled, NLDInTerminalEnabled,
-    NaturalLanguageAutosuggestionsEnabled, RuleSuggestionsEnabled,
-    SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
+    CodebaseContextEnabled, FileBasedMcpEnabled, GitOperationsAutogenEnabled,
+    IncludeAgentCommandsInHistory, InputSettings, IntelligentAutosuggestionsEnabled,
+    LongRunningCommandSubmissionMode, MemoryEnabled, NLDInTerminalEnabled,
+    NaturalLanguageAutosuggestionsEnabled, OrchestrationMessageDisplayMode, PromptSubmissionMode,
+    RuleSuggestionsEnabled, SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
     ShouldRenderUseAgentToolbarForUserCommands, ShouldShowOzUpdatesInZeroState, ShowAgentTips,
     ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VoiceInputEnabled,
     WarpDriveContextEnabled,
 };
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::CLIAgent;
-use crate::view_components::action_button::{ActionButton, ButtonSize, SecondaryTheme};
-use crate::view_components::{FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent};
+use crate::view_components::action_button::{
+    ActionButton, ButtonSize, DangerSecondaryTheme, SecondaryTheme,
+};
+use crate::view_components::{
+    render_warning_box, FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent,
+    WarningBoxConfig,
+};
 use crate::workspaces::user_workspaces::UserWorkspacesEvent;
 
 /// Identifies which subpage of the AI settings the user is viewing.
@@ -128,7 +139,7 @@ use std::sync::LazyLock;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 
 use crate::ai::{AIRequestUsageModel, AIRequestUsageModelEvent};
-use crate::appearance::Appearance;
+use crate::appearance::{Appearance, AppearanceEvent};
 use crate::editor::{EditorView, Event as EditorEvent, TextOptions};
 use crate::menu::{MenuItem, MenuItemFields};
 use crate::server::telemetry::{
@@ -165,7 +176,7 @@ const GIT_OPERATIONS_AUTOGEN_DESCRIPTION: &str =
     "Let AI generate commit messages and pull request titles and descriptions.";
 const WISPR_FLOW_URL: &str = "https://wisprflow.ai/";
 const CUSTOM_INFERENCE_LEARN_MORE_URL: &str =
-    "https://docs.warp.dev/support-and-community/plans-and-billing/bring-your-own-api-key/";
+    "https://docs.warp.dev/agent-platform/inference/custom-inference-endpoint/";
 const CUSTOM_INFERENCE_TERMS_URL: &str = "https://www.warp.dev/legal/terms-of-service";
 const CUSTOM_INFERENCE_INFO_TOOLTIP_MAX_WIDTH: f32 = 320.;
 
@@ -330,6 +341,83 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             .collect();
         app.register_fixed_bindings(mode_bindings);
     }
+    {
+        use warpui::keymap::FixedBinding;
+
+        let ai_context = context.clone() & id!(flags::IS_ANY_AI_ENABLED);
+        let mode_bindings: Vec<FixedBinding> = OrchestrationMessageDisplayMode::iter()
+            .map(|mode| {
+                let context_flag = match mode {
+                    OrchestrationMessageDisplayMode::ShowAndCollapse => {
+                        flags::ORCHESTRATION_MESSAGE_DISPLAY_SHOW_AND_COLLAPSE
+                    }
+                    OrchestrationMessageDisplayMode::AlwaysShow => {
+                        flags::ORCHESTRATION_MESSAGE_DISPLAY_ALWAYS_SHOW
+                    }
+                    OrchestrationMessageDisplayMode::AlwaysCollapse => {
+                        flags::ORCHESTRATION_MESSAGE_DISPLAY_ALWAYS_COLLAPSE
+                    }
+                };
+                FixedBinding::empty(
+                    mode.command_palette_description(),
+                    builder(SettingsAction::AI(
+                        AISettingsPageAction::SetOrchestrationMessageDisplayMode(mode),
+                    )),
+                    ai_context.clone() & !id!(context_flag),
+                )
+                .with_group(bindings::BindingGroup::WarpAi.as_str())
+            })
+            .collect();
+        app.register_fixed_bindings(mode_bindings);
+    }
+    if FeatureFlag::QueueSlashCommand.is_enabled() {
+        use warpui::keymap::FixedBinding;
+
+        let ai_context = context.clone() & id!(flags::IS_ANY_AI_ENABLED);
+        let mode_bindings: Vec<FixedBinding> = PromptSubmissionMode::iter()
+            .map(|mode| {
+                let context_flag = match mode {
+                    PromptSubmissionMode::Interrupt => flags::PROMPT_SUBMISSION_INTERRUPT,
+                    PromptSubmissionMode::Queue => flags::PROMPT_SUBMISSION_QUEUE,
+                };
+                FixedBinding::empty(
+                    mode.command_palette_description(),
+                    builder(SettingsAction::AI(
+                        AISettingsPageAction::SetPromptSubmissionMode(mode),
+                    )),
+                    ai_context.clone() & !id!(context_flag),
+                )
+                .with_group(bindings::BindingGroup::WarpAi.as_str())
+            })
+            .collect();
+        app.register_fixed_bindings(mode_bindings);
+
+        // The LRC submission mode only applies (and is only shown) when the default
+        // prompt submission mode is Interrupt, so its palette entries are gated on it.
+        let lrc_mode_bindings: Vec<FixedBinding> = LongRunningCommandSubmissionMode::iter()
+            .map(|mode| {
+                let context_flag = match mode {
+                    LongRunningCommandSubmissionMode::SendImmediately => {
+                        flags::LRC_SUBMISSION_SEND_IMMEDIATELY
+                    }
+                    LongRunningCommandSubmissionMode::QueueUntilCommandCompletes => {
+                        flags::LRC_SUBMISSION_QUEUE_UNTIL_COMMAND_COMPLETES
+                    }
+                };
+                FixedBinding::empty(
+                    mode.command_palette_description(),
+                    builder(SettingsAction::AI(
+                        AISettingsPageAction::SetLongRunningCommandSubmissionMode(mode),
+                    )),
+                    ai_context.clone()
+                        & id!(flags::PROMPT_SUBMISSION_INTERRUPT)
+                        & !id!(context_flag),
+                )
+                .with_group(bindings::BindingGroup::WarpAi.as_str())
+            })
+            .collect();
+        app.register_fixed_bindings(lrc_mode_bindings);
+    }
     ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
         vec![ToggleSettingActionPair::new(
             "natural language autosuggestions",
@@ -354,6 +442,24 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         )
         .with_group(bindings::BindingGroup::WarpAi)
         .with_enabled(|| FeatureFlag::SharedBlockTitleGeneration.is_enabled())],
+        app,
+    );
+    ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
+        vec![ToggleSettingActionPair::new(
+            "commit and pull request generation",
+            builder(SettingsAction::AI(
+                AISettingsPageAction::ToggleGitOperationsAutogen,
+            )),
+            &(context.clone() & id!(flags::IS_ACTIVE_AI_ENABLED)),
+            flags::GIT_OPERATIONS_AUTOGEN_FLAG,
+        )
+        .with_enabled(|| FeatureFlag::GitOperationsInCodeReview.is_enabled())
+        .is_supported_on_current_platform(
+            AISettings::as_ref(app)
+                .git_operations_autogen_enabled_internal
+                .is_supported_on_current_platform()
+                && UserWorkspaces::as_ref(app).is_git_operations_ai_enabled(),
+        )],
         app,
     );
     ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
@@ -385,6 +491,143 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             None,
         )
         .with_group(bindings::BindingGroup::WarpAi)],
+        app,
+    );
+    ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
+        vec![
+            ToggleSettingActionPair::new(
+                "include agent-executed commands in history",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleIncludeAgentCommandsInHistory,
+                )),
+                &(context.clone() & id!(flags::IS_ANY_AI_ENABLED)),
+                flags::INCLUDE_AGENT_COMMANDS_IN_HISTORY_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi),
+            ToggleSettingActionPair::new(
+                "conversation history in tools panel",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleShowConversationHistory,
+                )),
+                &(context.clone() & id!(flags::IS_ANY_AI_ENABLED)),
+                flags::SHOW_CONVERSATION_HISTORY,
+            )
+            .with_group(bindings::BindingGroup::WarpAi),
+            ToggleSettingActionPair::new(
+                "model picker in prompt",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleShowBaseModelPickerInPrompt,
+                )),
+                &(context.clone() & id!(flags::IS_ANY_AI_ENABLED)),
+                flags::SHOW_BASE_MODEL_PICKER_IN_PROMPT_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi),
+            ToggleSettingActionPair::new(
+                "coding agent toolbar",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleCLIAgentToolbar,
+                )),
+                context,
+                flags::CLI_AGENT_FOOTER_ENABLED,
+            )
+            .with_group(bindings::BindingGroup::WarpAi),
+        ],
+        app,
+    );
+    ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
+        vec![
+            ToggleSettingActionPair::new(
+                "Rules",
+                builder(SettingsAction::AI(AISettingsPageAction::ToggleRules)),
+                &(context.clone() & id!(flags::IS_ANY_AI_ENABLED)),
+                flags::AI_RULES_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi)
+            .with_enabled(|| FeatureFlag::AIRules.is_enabled()),
+            ToggleSettingActionPair::new(
+                "Suggested Rules",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleRuleSuggestions,
+                )),
+                &(context.clone() & id!(flags::IS_ANY_AI_ENABLED)),
+                flags::SUGGESTED_RULES_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi)
+            .with_enabled(|| {
+                FeatureFlag::AIRules.is_enabled() && FeatureFlag::SuggestedRules.is_enabled()
+            }),
+            ToggleSettingActionPair::new(
+                "Warp Drive as agent context",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleWarpDriveContext,
+                )),
+                &(context.clone() & id!(flags::IS_ANY_AI_ENABLED)),
+                flags::WARP_DRIVE_CONTEXT_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi)
+            .with_enabled(|| FeatureFlag::AIRules.is_enabled()),
+            ToggleSettingActionPair::new(
+                "Auto-spawn servers from third-party agents",
+                builder(SettingsAction::AI(AISettingsPageAction::ToggleFileBasedMcp)),
+                &(context.clone() & id!(flags::IS_ANY_AI_ENABLED)),
+                flags::FILE_BASED_MCP_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi)
+            .with_enabled(|| {
+                FeatureFlag::McpServer.is_enabled()
+                    && FeatureFlag::FileBasedMcp.is_enabled()
+                    && ContextFlag::ShowMCPServers.is_enabled()
+            }),
+        ],
+        app,
+    );
+    ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
+        vec![
+            ToggleSettingActionPair::new(
+                "Warp credit fallback",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleCanUseWarpCreditsForFallback,
+                )),
+                &(context.clone() & id!(flags::IS_ANY_AI_ENABLED)),
+                flags::WARP_CREDIT_FALLBACK_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi)
+            .is_supported_on_current_platform(
+                UserWorkspaces::as_ref(app).is_byo_api_key_enabled(app)
+                    || (FeatureFlag::CustomInferenceEndpoints.is_enabled()
+                        && UserWorkspaces::as_ref(app).is_custom_inference_enabled(app)),
+            ),
+            ToggleSettingActionPair::new(
+                "auto show or hide Rich Input based on agent status",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleAutoToggleRichInput,
+                )),
+                &(context.clone() & id!(flags::CLI_AGENT_FOOTER_ENABLED)),
+                flags::AUTO_TOGGLE_RICH_INPUT_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi)
+            .with_enabled(|| FeatureFlag::CLIAgentRichInput.is_enabled()),
+            ToggleSettingActionPair::new(
+                "auto open Rich Input when a coding agent session starts",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleAutoOpenRichInputOnCLIAgentStart,
+                )),
+                &(context.clone() & id!(flags::CLI_AGENT_FOOTER_ENABLED)),
+                flags::AUTO_OPEN_RICH_INPUT_ON_CLI_AGENT_START_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi)
+            .with_enabled(|| FeatureFlag::CLIAgentRichInput.is_enabled()),
+            ToggleSettingActionPair::new(
+                "auto dismiss Rich Input after prompt submission",
+                builder(SettingsAction::AI(
+                    AISettingsPageAction::ToggleAutoDismissRichInputAfterSubmit,
+                )),
+                &(context.clone() & id!(flags::CLI_AGENT_FOOTER_ENABLED)),
+                flags::AUTO_DISMISS_RICH_INPUT_AFTER_SUBMIT_FLAG,
+            )
+            .with_group(bindings::BindingGroup::WarpAi)
+            .with_enabled(|| FeatureFlag::CLIAgentRichInput.is_enabled()),
+        ],
         app,
     );
     if !FeatureFlag::FullSourceCodeEmbedding.is_enabled() {
@@ -456,8 +699,12 @@ pub struct AISettingsPageView {
     context_window_slider_state: SliderStateHandle,
     context_window_editor: ViewHandle<EditorView>,
     last_synced_context_window_editor_value: Option<u32>,
+    dragged_context_window_value: Option<u32>,
 
     thinking_display_mode_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    orchestration_message_display_mode_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    default_prompt_submission_mode_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    lrc_submission_mode_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
     #[cfg(feature = "local_fs")]
     conversation_layout_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
 
@@ -465,12 +712,26 @@ pub struct AISettingsPageView {
     profile_views: Vec<ViewHandle<ExecutionProfileView>>,
     add_profile_button: ViewHandle<ActionButton>,
 
+    // Custom model router views (gated on FeatureFlag::CustomModelRouters)
+    #[cfg(feature = "local_fs")]
+    router_views: Vec<ViewHandle<super::custom_router_view::CustomRouterView>>,
+    #[cfg(feature = "local_fs")]
+    add_router_button: ViewHandle<ActionButton>,
+
     // Custom inference (custom endpoints)
     custom_endpoint_modal_state: CustomEndpointModalViewState,
     remove_custom_endpoint_confirmation_dialog: ViewHandle<RemoveCustomEndpointConfirmationDialog>,
     pending_remove_custom_endpoint_index: Option<usize>,
     custom_inference_add_button: ViewHandle<ActionButton>,
     custom_endpoint_edit_buttons: Vec<ViewHandle<ActionButton>>,
+
+    // In-flight fallback exchange for a pasted SuperGrok authorization code.
+    // This stores only the PKCE verifier clone needed by the manual path while
+    // `OauthAttempt::finish` owns the full loopback attempt.
+    #[cfg(not(target_family = "wasm"))]
+    grok_oauth_attempt: Option<ManualCodeExchange>,
+    #[cfg(not(target_family = "wasm"))]
+    grok_code_editor: ViewHandle<EditorView>,
 }
 
 impl AISettingsPageView {
@@ -598,6 +859,40 @@ impl AISettingsPageView {
             thinking_display_mode_dropdown.update(ctx, |dropdown, ctx| {
                 dropdown.set_selected_by_action(
                     AISettingsPageAction::SetThinkingDisplayMode(current_mode),
+                    ctx,
+                );
+            });
+        }
+        let orchestration_message_display_mode_dropdown =
+            OtherAIWidget::create_orchestration_message_display_mode_dropdown(ctx);
+        {
+            let current_mode = AISettings::as_ref(ctx).orchestration_message_display_mode;
+            orchestration_message_display_mode_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetOrchestrationMessageDisplayMode(current_mode),
+                    ctx,
+                );
+            });
+        }
+
+        let default_prompt_submission_mode_dropdown =
+            OtherAIWidget::create_default_prompt_submission_mode_dropdown(ctx);
+        {
+            let current_mode = AISettings::as_ref(ctx).default_prompt_submission_mode;
+            default_prompt_submission_mode_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetPromptSubmissionMode(current_mode),
+                    ctx,
+                );
+            });
+        }
+
+        let lrc_submission_mode_dropdown = OtherAIWidget::create_lrc_submission_mode_dropdown(ctx);
+        {
+            let current_mode = AISettings::as_ref(ctx).long_running_command_submission_mode;
+            lrc_submission_mode_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetLongRunningCommandSubmissionMode(current_mode),
                     ctx,
                 );
             });
@@ -776,7 +1071,6 @@ impl AISettingsPageView {
 
         let request_usage_model = AIRequestUsageModel::handle(ctx);
         ctx.subscribe_to_model(&request_usage_model, |_, _, _, ctx| {
-            // The only event is RequestUsageUpdated
             ctx.notify();
         });
 
@@ -1002,6 +1296,40 @@ impl AISettingsPageView {
                         .update(ctx, |dropdown, ctx| {
                             dropdown.set_selected_by_action(
                                 AISettingsPageAction::SetThinkingDisplayMode(current_mode),
+                                ctx,
+                            );
+                        });
+                }
+                AISettingsChangedEvent::OrchestrationMessageDisplayMode { .. } => {
+                    let current_mode = AISettings::as_ref(ctx).orchestration_message_display_mode;
+                    me.orchestration_message_display_mode_dropdown
+                        .update(ctx, |dropdown, ctx| {
+                            dropdown.set_selected_by_action(
+                                AISettingsPageAction::SetOrchestrationMessageDisplayMode(
+                                    current_mode,
+                                ),
+                                ctx,
+                            );
+                        });
+                }
+                AISettingsChangedEvent::PromptSubmissionMode { .. } => {
+                    let current_mode = AISettings::as_ref(ctx).default_prompt_submission_mode;
+                    me.default_prompt_submission_mode_dropdown
+                        .update(ctx, |dropdown, ctx| {
+                            dropdown.set_selected_by_action(
+                                AISettingsPageAction::SetPromptSubmissionMode(current_mode),
+                                ctx,
+                            );
+                        });
+                }
+                AISettingsChangedEvent::LongRunningCommandSubmissionMode { .. } => {
+                    let current_mode = AISettings::as_ref(ctx).long_running_command_submission_mode;
+                    me.lrc_submission_mode_dropdown
+                        .update(ctx, |dropdown, ctx| {
+                            dropdown.set_selected_by_action(
+                                AISettingsPageAction::SetLongRunningCommandSubmissionMode(
+                                    current_mode,
+                                ),
                                 ctx,
                             );
                         });
@@ -1349,12 +1677,33 @@ impl AISettingsPageView {
             match event {
                 AIRequestUsageModelEvent::RequestUsageUpdated => ctx.notify(),
                 AIRequestUsageModelEvent::RequestBonusRefunded { .. } => ctx.notify(),
+                AIRequestUsageModelEvent::AmbientCreditsBannerDismissed => {}
             }
             Self::refresh_base_model_menu(&me.base_model_dropdown, ctx);
             Self::refresh_coding_model_menu(&me.coding_model_dropdown, ctx);
         });
 
         let profile_views = Self::create_profile_views(ctx);
+
+        // Custom model router views
+        #[cfg(feature = "local_fs")]
+        let router_views = Self::create_router_views(ctx);
+        #[cfg(feature = "local_fs")]
+        let add_router_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("+ Add router", SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::OpenAddCustomRouter);
+                })
+        });
+        #[cfg(feature = "local_fs")]
+        {
+            let is_enabled = warp_core::features::FeatureFlag::CustomModelRouters.is_enabled()
+                && is_any_ai_enabled;
+            add_router_button.update(ctx, |button, ctx| {
+                button.set_disabled(!is_enabled, ctx);
+            });
+        }
 
         let add_profile_button = ctx.add_typed_action_view(|_| {
             ActionButton::new("Add Profile", SecondaryTheme)
@@ -1486,6 +1835,42 @@ impl AISettingsPageView {
             dropdown
         });
 
+        #[cfg(not(target_family = "wasm"))]
+        let grok_code_editor = Self::create_grok_code_editor(ctx);
+        #[cfg(not(target_family = "wasm"))]
+        ctx.subscribe_to_view(&grok_code_editor, |me, _, event, ctx| {
+            if matches!(event, EditorEvent::Enter | EditorEvent::Paste) {
+                let code = me.grok_code_editor.as_ref(ctx).buffer_text(ctx);
+                me.submit_grok_code(code, ctx);
+            }
+        });
+        // Keep the snapshotted editor text colors in sync with theme changes,
+        // like the API key editors above.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let grok_code_editor = grok_code_editor.clone();
+            ctx.subscribe_to_model(&Appearance::handle(ctx), move |_, _, event, ctx| {
+                if let AppearanceEvent::ThemeChanged = event {
+                    let colors = editor_text_colors(Appearance::as_ref(ctx));
+                    grok_code_editor.update(ctx, move |editor, ctx| {
+                        editor.set_text_colors(colors, ctx);
+                    });
+                }
+            });
+        }
+        // Subscribe to WarpConfig to refresh router views when files change.
+        #[cfg(feature = "local_fs")]
+        ctx.subscribe_to_model(
+            &crate::user_config::WarpConfig::handle(ctx),
+            |me, _, event, ctx| {
+                use crate::user_config::WarpConfigUpdateEvent;
+                if matches!(event, WarpConfigUpdateEvent::ModelConfigs) {
+                    me.router_views = Self::create_router_views(ctx);
+                    ctx.notify();
+                }
+            },
+        );
+
         Self {
             page: Self::build_page(None, ctx),
             active_subpage: None,
@@ -1506,6 +1891,7 @@ impl AISettingsPageView {
             context_window_slider_state,
             context_window_editor,
             last_synced_context_window_editor_value,
+            dragged_context_window_value: None,
             autonomy_dropdown_menu,
             code_read_allowlist_editor,
             code_read_autonomy_dropdown_menu,
@@ -1527,15 +1913,26 @@ impl AISettingsPageView {
             mcp_denylist_dropdown,
             mcp_denylist_mouse_state_handles,
             thinking_display_mode_dropdown,
+            orchestration_message_display_mode_dropdown,
+            default_prompt_submission_mode_dropdown,
+            lrc_submission_mode_dropdown,
             #[cfg(feature = "local_fs")]
             conversation_layout_dropdown,
             profile_views,
             add_profile_button,
+            #[cfg(feature = "local_fs")]
+            router_views,
+            #[cfg(feature = "local_fs")]
+            add_router_button,
             custom_endpoint_modal_state,
             remove_custom_endpoint_confirmation_dialog,
             pending_remove_custom_endpoint_index: None,
             custom_inference_add_button,
             custom_endpoint_edit_buttons,
+            #[cfg(not(target_family = "wasm"))]
+            grok_oauth_attempt: None,
+            #[cfg(not(target_family = "wasm"))]
+            grok_code_editor,
         }
     }
 
@@ -1840,6 +2237,227 @@ impl AISettingsPageView {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn create_grok_code_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(editor_text_colors(appearance)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text("Paste sign-in code", ctx);
+            editor
+        })
+    }
+
+    /// Kicks off the xAI (Grok) subscription OAuth flow: opens the consent
+    /// screen in the browser, runs a loopback PKCE callback server, exchanges
+    /// the resulting authorization code for OAuth tokens, and persists them via
+    /// `ApiKeyManager` (which then proactively refreshes them before expiry).
+    ///
+    /// In parallel, this reveals the manual code-entry row so the user can
+    /// paste the code xAI displays when the browser can't reach the loopback
+    /// callback. Whichever path completes first connects the subscription; the
+    /// other completion is ignored once the view-owned attempt state is cleared.
+    #[cfg(not(target_family = "wasm"))]
+    fn start_grok_oauth(&mut self, ctx: &mut ViewContext<Self>) {
+        use warp_core::safe_error;
+
+        use crate::view_components::{DismissibleToast, ToastLink};
+        use crate::workspace::WorkspaceAction;
+        use crate::ToastStack;
+
+        /// Object id shared by the connect-flow toasts so the completion toast
+        /// (success or error) automatically replaces the in-progress one.
+        const CONNECT_TOAST_OBJECT_ID: &str = "grok_oauth_connect_toast";
+
+        // Record attempt initiation on click (before we attempt to bind the
+        // loopback server). This ensures every terminal SuperGrokSubscriptionConnectFinished
+        // (including immediate bind failures) is paired with a preceding Initiated
+        // for funnel/drop-off analysis.
+        send_telemetry_from_ctx!(TelemetryEvent::SuperGrokSubscriptionConnectInitiated, ctx);
+
+        // Starting the attempt binds the loopback callback server before the
+        // browser opens, so a bind failure surfaces immediately, without a
+        // dangling browser tab.
+        let attempt = match oauth::OauthAttempt::start() {
+            Ok(attempt) => attempt,
+            Err(err) => {
+                safe_error!(
+                    safe: ("Failed to start Grok OAuth callback server"),
+                    full: ("Failed to start Grok OAuth callback server: {err:#}")
+                );
+                send_telemetry_from_ctx!(
+                    TelemetryEvent::SuperGrokSubscriptionConnectFinished {
+                        error: Some("bind_failed".to_string()),
+                    },
+                    ctx
+                );
+                let window_id = ctx.window_id();
+                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    let toast =
+                        DismissibleToast::error(format!("Couldn't start Grok login: {err}"));
+                    toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+                });
+                return;
+            }
+        };
+
+        // Capture the PKCE verifier so the fallback is ready if xAI shows a
+        // code instead of redirecting.
+        self.grok_oauth_attempt = Some(attempt.manual_code_exchange());
+        self.grok_code_editor.update(ctx, |editor, ctx| {
+            editor.clear_buffer(ctx);
+        });
+        ctx.notify();
+        // Open xAI's consent screen in the user's default browser.
+        let authorize_url = attempt.authorize_url();
+        ctx.open_url(&authorize_url);
+
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            // Persistent rather than ephemeral so the copy-URL fallback stays
+            // available when the browser fails to open. It can't linger
+            // forever: the completion toast below replaces it (shared object
+            // id), and the OAuth attempt itself times out when the callback
+            // never arrives.
+            let toast = DismissibleToast::default(
+                "Opening your browser to connect your SuperGrok subscription…".to_string(),
+            )
+            .with_object_id(CONNECT_TOAST_OBJECT_ID.to_string())
+            .with_link(
+                ToastLink::new("Copy URL".to_string())
+                    .with_onclick_action(WorkspaceAction::CopyTextToClipboard(authorize_url)),
+            );
+            toast_stack.add_persistent_toast(toast, window_id, ctx);
+        });
+
+        ctx.spawn(async move { attempt.finish().await }, |me, result, ctx| {
+            // Ignore loopback completion after a successful pasted-code path.
+            if me.grok_oauth_attempt.is_none() {
+                return;
+            }
+            let window_id = ctx.window_id();
+            let toast = match result {
+                Ok(tokens) => {
+                    me.grok_oauth_attempt = None;
+                    me.grok_code_editor.update(ctx, |editor, ctx| {
+                        editor.clear_buffer(ctx);
+                    });
+                    send_telemetry_from_ctx!(
+                        TelemetryEvent::SuperGrokSubscriptionConnectFinished { error: None },
+                        ctx
+                    );
+                    // Persist the tokens to secure storage and kick off the
+                    // proactive refresh loop so subsequent requests can
+                    // authenticate with the connected subscription.
+                    ApiKeyManager::handle(ctx).update(ctx, move |manager, ctx| {
+                        manager.store_grok_tokens(tokens, ctx);
+                    });
+                    DismissibleToast::success("SuperGrok subscription connected".to_string())
+                }
+                Err(err) => {
+                    me.grok_oauth_attempt = None;
+                    me.grok_code_editor.update(ctx, |editor, ctx| {
+                        editor.clear_buffer(ctx);
+                    });
+                    safe_error!(
+                        safe: ("Grok OAuth loopback callback failed"),
+                        full: ("Grok OAuth loopback callback failed: {err:#}")
+                    );
+                    send_telemetry_from_ctx!(
+                        TelemetryEvent::SuperGrokSubscriptionConnectFinished {
+                            error: Some("loopback_failed".to_string()),
+                        },
+                        ctx
+                    );
+                    DismissibleToast::error(format!("Couldn't connect SuperGrok: {err}"))
+                }
+            };
+            ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                toast_stack.add_ephemeral_toast(
+                    toast.with_object_id(CONNECT_TOAST_OBJECT_ID.to_string()),
+                    window_id,
+                    ctx,
+                );
+            });
+            ctx.notify();
+        });
+    }
+
+    /// Exchanges a pasted SuperGrok authorization code using the current
+    /// attempt's PKCE verifier.
+    #[cfg(not(target_family = "wasm"))]
+    fn submit_grok_code(&mut self, code: String, ctx: &mut ViewContext<Self>) {
+        use warp_core::safe_error;
+
+        use crate::view_components::DismissibleToast;
+        use crate::ToastStack;
+
+        // Shared with the browser connect-flow toasts.
+        const CONNECT_TOAST_OBJECT_ID: &str = "grok_oauth_connect_toast";
+        let Some(exchange) = self.grok_oauth_attempt.clone() else {
+            return;
+        };
+        if code.trim().is_empty() {
+            return;
+        }
+
+        ctx.spawn(
+            async move { exchange.exchange(&code).await },
+            |me, result, ctx| {
+                if me.grok_oauth_attempt.is_none() {
+                    return;
+                }
+                let window_id = ctx.window_id();
+                let toast = match result {
+                    Ok(tokens) => {
+                        me.grok_oauth_attempt = None;
+                        me.grok_code_editor.update(ctx, |editor, ctx| {
+                            editor.clear_buffer(ctx);
+                        });
+                        send_telemetry_from_ctx!(
+                            TelemetryEvent::SuperGrokSubscriptionConnectFinished { error: None },
+                            ctx
+                        );
+                        ApiKeyManager::handle(ctx).update(ctx, move |manager, ctx| {
+                            manager.store_grok_tokens(tokens, ctx);
+                        });
+                        DismissibleToast::success("SuperGrok subscription connected".to_string())
+                    }
+                    Err(err) => {
+                        // Keep the row open so the user can correct the code.
+                        safe_error!(
+                            safe: ("Grok manual code exchange failed"),
+                            full: ("Grok manual code exchange failed: {err:#}")
+                        );
+                        send_telemetry_from_ctx!(
+                            TelemetryEvent::SuperGrokSubscriptionConnectFinished {
+                                error: Some("manual_code_failed".to_string()),
+                            },
+                            ctx
+                        );
+                        DismissibleToast::error(format!("Couldn't connect SuperGrok: {err}"))
+                    }
+                };
+                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    toast_stack.add_ephemeral_toast(
+                        toast.with_object_id(CONNECT_TOAST_OBJECT_ID.to_string()),
+                        window_id,
+                        ctx,
+                    );
+                });
+                ctx.notify();
+            },
+        );
+    }
+
     /// Set the active subpage and rebuild the widget list to show only relevant widgets.
     pub fn set_active_subpage(&mut self, subpage: Option<AISubpage>, ctx: &mut ViewContext<Self>) {
         if self.active_subpage != subpage {
@@ -1944,6 +2562,9 @@ impl AISettingsPageView {
                 widgets.push(Box::new(CloudHandoffWidget::default()));
                 widgets.push(Box::new(ApiKeysWidget::new(ctx)));
                 widgets.push(Box::new(AwsBedrockWidget::new(ctx)));
+                if FeatureFlag::CustomModelRouters.is_enabled() {
+                    widgets.push(Box::new(CustomModelRoutersWidget));
+                }
                 widgets.push(Box::new(AgentAttributionWidget::default()));
                 widgets.push(Box::new(OtherAIWidget::default()));
                 if FeatureFlag::AgentModeComputerUse.is_enabled() {
@@ -2042,6 +2663,7 @@ impl AISettingsPageView {
     }
 
     fn sync_context_window_editor(&mut self, ctx: &mut ViewContext<Self>, force: bool) {
+        self.dragged_context_window_value = None;
         let Some(value) = Self::current_context_window_display_value(ctx) else {
             self.last_synced_context_window_editor_value = None;
             self.context_window_slider_state.reset_offset();
@@ -2134,7 +2756,11 @@ impl AISettingsPageView {
 
             let items = available_model_menu_items(
                 choices,
-                |llm| AISettingsPageAction::SetBaseModel(llm.id.clone()).into(),
+                |llm| {
+                    DropdownAction::select_action_and_close(AISettingsPageAction::SetBaseModel(
+                        llm.id.clone(),
+                    ))
+                },
                 None,
                 None,
                 false,
@@ -2169,7 +2795,11 @@ impl AISettingsPageView {
 
             let items = available_model_menu_items(
                 choices,
-                |llm| AISettingsPageAction::SetCodingModel(llm.id.clone()).into(),
+                |llm| {
+                    DropdownAction::select_action_and_close(AISettingsPageAction::SetCodingModel(
+                        llm.id.clone(),
+                    ))
+                },
                 None,
                 None,
                 false,
@@ -2462,6 +3092,50 @@ impl AISettingsPageView {
         Self::refresh_menu_dropdown(menu, AISettingsPageAction::AddToMCPAllowlist, ctx);
     }
 
+    #[cfg(feature = "local_fs")]
+    fn create_router_views(
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<ViewHandle<super::custom_router_view::CustomRouterView>> {
+        use super::custom_router_view::{CustomRouterView, CustomRouterViewEvent};
+        use crate::user_config::WarpConfig;
+        if !warp_core::features::FeatureFlag::CustomModelRouters.is_enabled() {
+            return Vec::new();
+        }
+        let routers: Vec<crate::ai::custom_model_routers::CustomModelRouter> =
+            WarpConfig::as_ref(ctx).custom_model_routers().clone();
+        routers
+            .into_iter()
+            .map(|router| {
+                let router_clone = router.clone();
+                let view = ctx.add_typed_action_view(|ctx| CustomRouterView::new(router, ctx));
+                ctx.subscribe_to_view(&view, move |me, _, event, ctx| match event {
+                    CustomRouterViewEvent::OpenFile(path) => {
+                        ctx.emit(AISettingsPageEvent::OpenCustomRouterFile(path.clone()));
+                    }
+                    CustomRouterViewEvent::Edit => {
+                        let r = router_clone.clone();
+                        ctx.emit(AISettingsPageEvent::OpenCustomRouterEditor(Some(r)));
+                    }
+                    CustomRouterViewEvent::Delete => {
+                        if let Some(path) = &router_clone.source_path {
+                            #[cfg(feature = "local_fs")]
+                            {
+                                if let Err(e) =
+                                    crate::user_config::WarpConfig::delete_custom_model_router(path)
+                                {
+                                    log::warn!("Failed to delete custom router: {e:?}");
+                                }
+                            }
+                            me.router_views = Self::create_router_views(ctx);
+                            ctx.notify();
+                        }
+                    }
+                });
+                view
+            })
+            .collect()
+    }
+
     fn create_profile_views(ctx: &mut ViewContext<Self>) -> Vec<ViewHandle<ExecutionProfileView>> {
         let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
         let profile_ids = profiles_model.get_all_profile_ids();
@@ -2516,7 +3190,7 @@ impl AISettingsPageView {
                     dropdown.set_menu_width(180., ctx);
                     dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
 
-                    let mut items: Vec<MenuItem<DropdownAction<AISettingsPageAction>>> = Vec::new();
+                    let mut items: Vec<MenuItem<DropdownAction>> = Vec::new();
 
                     for agent in all::<CLIAgent>() {
                         if matches!(agent, CLIAgent::Unknown) {
@@ -2524,7 +3198,7 @@ impl AISettingsPageView {
                         }
                         let icon = agent.icon();
                         let mut fields = MenuItemFields::new(agent.display_name())
-                            .with_on_select_action(DropdownAction::SelectActionAndClose(
+                            .with_on_select_action(DropdownAction::select_action_and_close(
                                 AISettingsPageAction::SetCLIAgentForCommand {
                                     pattern: pattern_clone.clone(),
                                     agent: Some(agent),
@@ -2538,7 +3212,7 @@ impl AISettingsPageView {
 
                     items.push(
                         MenuItemFields::new("Other")
-                            .with_on_select_action(DropdownAction::SelectActionAndClose(
+                            .with_on_select_action(DropdownAction::select_action_and_close(
                                 AISettingsPageAction::SetCLIAgentForCommand {
                                     pattern: pattern_clone.clone(),
                                     agent: None,
@@ -2581,10 +3255,15 @@ impl View for AISettingsPageView {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum AISettingsPageEvent {
     FocusModal,
     OpenAIFactCollection,
     OpenMCPServerCollection,
+    #[cfg(feature = "local_fs")]
+    OpenCustomRouterEditor(Option<crate::ai::custom_model_routers::CustomModelRouter>),
+    #[cfg(feature = "local_fs")]
+    OpenCustomRouterFile(PathBuf),
     OpenExecutionProfileEditor(ClientProfileId),
     SignupAnonymousUser,
     ShowModal,
@@ -2619,6 +3298,9 @@ pub enum AISettingsPageAction {
     ToggleShowAgentTips,
     ToggleShowOzUpdatesInZeroState,
     SetThinkingDisplayMode(ThinkingDisplayMode),
+    SetOrchestrationMessageDisplayMode(OrchestrationMessageDisplayMode),
+    SetPromptSubmissionMode(PromptSubmissionMode),
+    SetLongRunningCommandSubmissionMode(LongRunningCommandSubmissionMode),
     AttemptLoginGatedUpgrade,
     RemoveCLIAgentToolbarEnabledCommand(String),
     RemoveFromCommandExecutionAllowlist(AgentModeCommandExecutionPredicate),
@@ -2662,11 +3344,16 @@ pub enum AISettingsPageAction {
     ToggleFileBasedMcp,
     ToggleIncludeAgentCommandsInHistory,
     ToggleAgentAttribution,
-    ToggleFeedbackBundledSkill,
+
+    // Custom model routers
+    #[cfg(feature = "local_fs")]
+    OpenAddCustomRouter,
 
     // Custom inference
     OpenAddCustomEndpointModal,
     OpenEditCustomEndpointModal(usize),
+    ConnectGrokSubscription,
+    DisconnectGrokSubscription,
 
     #[cfg(feature = "local_fs")]
     SetConversationLayout(crate::util::file::external_editor::settings::OpenConversationPreference),
@@ -2677,6 +3364,7 @@ pub enum AISettingsPageAction {
     ToggleAutoToggleRichInput,
     ToggleAutoOpenRichInputOnCLIAgentStart,
     ToggleAutoDismissRichInputAfterSubmit,
+    ToggleSubmitRichInputOnCtrlEnter,
     SetCLIAgentForCommand {
         pattern: String,
         agent: Option<CLIAgent>,
@@ -2955,6 +3643,12 @@ impl TypedActionView for AISettingsPageView {
                 });
                 ctx.notify();
             }
+            AISettingsPageAction::ToggleSubmitRichInputOnCtrlEnter => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.submit_on_ctrl_enter.toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
             AISettingsPageAction::ToggleUseAgentToolbar => {
                 match AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     settings
@@ -3071,6 +3765,30 @@ impl TypedActionView for AISettingsPageView {
                 });
                 ctx.notify();
             }
+            AISettingsPageAction::SetOrchestrationMessageDisplayMode(mode) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .orchestration_message_display_mode
+                        .set_value(*mode, ctx));
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::SetPromptSubmissionMode(mode) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .default_prompt_submission_mode
+                        .set_value(*mode, ctx));
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::SetLongRunningCommandSubmissionMode(mode) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .long_running_command_submission_mode
+                        .set_value(*mode, ctx));
+                });
+                ctx.notify();
+            }
             AISettingsPageAction::AttemptLoginGatedUpgrade => {
                 AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                     auth_manager.attempt_login_gated_feature(
@@ -3129,6 +3847,7 @@ impl TypedActionView for AISettingsPageView {
                     return;
                 }
                 if Self::configurable_context_window(ctx).is_some() {
+                    self.dragged_context_window_value = Some(*value);
                     let formatted = value.to_string();
                     self.context_window_editor.update(ctx, |editor, ctx| {
                         editor.system_reset_buffer_text(&formatted, ctx);
@@ -3137,6 +3856,7 @@ impl TypedActionView for AISettingsPageView {
                 }
             }
             AISettingsPageAction::SetContextWindowSize(value) => {
+                self.dragged_context_window_value = None;
                 if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
                     self.sync_context_window_editor(ctx, true);
                     return;
@@ -3413,13 +4133,9 @@ impl TypedActionView for AISettingsPageView {
                 });
                 ctx.notify();
             }
-            AISettingsPageAction::ToggleFeedbackBundledSkill => {
-                AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                    report_if_error!(settings
-                        .feedback_bundled_skill_enabled
-                        .toggle_and_save_value(ctx));
-                });
-                ctx.notify();
+            #[cfg(feature = "local_fs")]
+            AISettingsPageAction::OpenAddCustomRouter => {
+                ctx.emit(AISettingsPageEvent::OpenCustomRouterEditor(None));
             }
             AISettingsPageAction::OpenAddCustomEndpointModal => {
                 self.show_add_custom_endpoint_modal(ctx);
@@ -3459,6 +4175,31 @@ impl TypedActionView for AISettingsPageView {
                     report_if_error!(settings
                         .agent_attribution_enabled
                         .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::ConnectGrokSubscription => {
+                #[cfg(not(target_family = "wasm"))]
+                self.start_grok_oauth(ctx);
+            }
+            AISettingsPageAction::DisconnectGrokSubscription => {
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    self.grok_oauth_attempt = None;
+                    self.grok_code_editor.update(ctx, |editor, ctx| {
+                        editor.clear_buffer(ctx);
+                    });
+                }
+                ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.set_grok_tokens(None, ctx);
+                });
+
+                let window_id = ctx.window_id();
+                crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    let toast = crate::view_components::DismissibleToast::default(
+                        "SuperGrok subscription disconnected".to_string(),
+                    );
+                    toast_stack.add_ephemeral_toast(toast, window_id, ctx);
                 });
                 ctx.notify();
             }
@@ -4586,8 +5327,7 @@ impl AgentsWidget {
 
     /// Renders the context window slider + numeric input row shown below the
     /// base model dropdown. Returns `None` if the active base model does not
-    /// advertise a configurable context window, global AI is disabled, or the
-    /// [`FeatureFlag::ConfigurableContextWindow`] flag is disabled.
+    /// advertise a configurable context window or global AI is disabled.
     fn render_context_window_setting(
         &self,
         view: &AISettingsPageView,
@@ -4595,9 +5335,6 @@ impl AgentsWidget {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Option<Box<dyn Element>> {
-        if !FeatureFlag::ConfigurableContextWindow.is_enabled() {
-            return None;
-        }
         if !ai_settings.is_any_ai_enabled(app) {
             return None;
         }
@@ -4697,12 +5434,22 @@ impl AgentsWidget {
         let row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(min_label)
-            .with_child(slider)
+            .with_child(Shrinkable::new(1., slider).finish())
             .with_child(max_label)
             .with_child(input_box)
             .finish();
 
-        Some(Flex::column().with_child(label).with_child(row).finish())
+        let mut column = Flex::column().with_child(label).with_child(row);
+        if AISettingsPageView::active_profile_data(app)
+            .should_show_long_context_pricing_warning(view.dragged_context_window_value, app)
+        {
+            column.add_child(render_warning_box(
+                WarningBoxConfig::formatted_title(long_context_pricing_warning_title()),
+                appearance,
+            ));
+        }
+
+        Some(column.finish())
     }
 
     fn render_permissions_section(
@@ -5403,7 +6150,7 @@ impl SettingsWidget for AIInputWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "oz agent ai input natural language detection autodetection prompt terminal command commands history shell executed execution"
+        "oz agent ai input natural language detection autodetection prompt terminal command commands history shell executed execution queue interrupt submission submit auto-queue response while responding default long-running long running lrc"
     }
 
     fn render(
@@ -5472,6 +6219,54 @@ impl SettingsWidget for AIInputWidget {
             &view.local_only_icon_tooltip_states,
             app,
         ));
+
+        if FeatureFlag::QueueSlashCommand.is_enabled() {
+            widget_children.push(render_dropdown_item(
+                appearance,
+                "Default prompt submission mode",
+                Some(
+                    "What happens when you submit a new prompt while the agent is still \
+                     responding. You can override this per conversation using the auto-queue \
+                     toggle.",
+                ),
+                None,
+                LocalOnlyIconState::for_setting(
+                    PromptSubmissionMode::storage_key(),
+                    PromptSubmissionMode::sync_to_cloud(),
+                    &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                    app,
+                ),
+                (!is_any_ai_enabled).then(|| appearance.theme().disabled_ui_text_color()),
+                &view.default_prompt_submission_mode_dropdown,
+            ));
+
+            // Only meaningful in Interrupt mode: with Queue selected, prompts already
+            // queue until the end of the full response, so the LRC mode is hidden.
+            if ai_settings.default_prompt_submission_mode == PromptSubmissionMode::Interrupt {
+                widget_children.push(
+                    Container::new(render_dropdown_item(
+                        appearance,
+                        "Default long-running command submission mode",
+                        Some(
+                            "What happens when you submit a prompt while an agent is driving an \
+                             agent-requested long-running command. Queued prompts are sent to the \
+                             agent when the command finishes.",
+                        ),
+                        None,
+                        LocalOnlyIconState::for_setting(
+                            LongRunningCommandSubmissionMode::storage_key(),
+                            LongRunningCommandSubmissionMode::sync_to_cloud(),
+                            &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                            app,
+                        ),
+                        (!is_any_ai_enabled).then(|| appearance.theme().disabled_ui_text_color()),
+                        &view.lrc_submission_mode_dropdown,
+                    ))
+                    .with_margin_top(styles::DESCRIPTION_MARGIN_BOTTOM)
+                    .finish(),
+                );
+            }
+        }
 
         Flex::column().with_children(widget_children).finish()
     }
@@ -6068,7 +6863,6 @@ struct OtherAIWidget {
     show_oz_updates_in_zero_state_toggle: SwitchStateHandle,
     use_agent_footer_toggle: SwitchStateHandle,
     show_conversation_history_toggle: SwitchStateHandle,
-    feedback_bundled_skill_toggle: SwitchStateHandle,
 }
 
 impl OtherAIWidget {
@@ -6093,13 +6887,81 @@ impl OtherAIWidget {
             dropdown
         })
     }
+
+    fn create_default_prompt_submission_mode_dropdown(
+        ctx: &mut ViewContext<AISettingsPageView>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        let items: Vec<DropdownItem<AISettingsPageAction>> = PromptSubmissionMode::iter()
+            .map(|mode| {
+                DropdownItem::new(
+                    mode.display_name(),
+                    AISettingsPageAction::SetPromptSubmissionMode(mode),
+                )
+            })
+            .collect();
+
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.set_menu_max_height(AI_SETTINGS_DROPDOWN_MAX_HEIGHT, ctx);
+            dropdown.add_items(items, ctx);
+            dropdown
+        })
+    }
+
+    fn create_lrc_submission_mode_dropdown(
+        ctx: &mut ViewContext<AISettingsPageView>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        let items: Vec<DropdownItem<AISettingsPageAction>> =
+            LongRunningCommandSubmissionMode::iter()
+                .map(|mode| {
+                    DropdownItem::new(
+                        mode.display_name(),
+                        AISettingsPageAction::SetLongRunningCommandSubmissionMode(mode),
+                    )
+                })
+                .collect();
+
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.set_menu_max_height(AI_SETTINGS_DROPDOWN_MAX_HEIGHT, ctx);
+            dropdown.add_items(items, ctx);
+            dropdown
+        })
+    }
+
+    fn create_orchestration_message_display_mode_dropdown(
+        ctx: &mut ViewContext<AISettingsPageView>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        let items: Vec<DropdownItem<AISettingsPageAction>> =
+            OrchestrationMessageDisplayMode::iter()
+                .map(|mode| {
+                    DropdownItem::new(
+                        mode.display_name(),
+                        AISettingsPageAction::SetOrchestrationMessageDisplayMode(mode),
+                    )
+                })
+                .collect();
+
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown.set_menu_max_height(AI_SETTINGS_DROPDOWN_MAX_HEIGHT, ctx);
+            dropdown.add_items(items, ctx);
+            dropdown
+        })
+    }
 }
 
 impl SettingsWidget for OtherAIWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "other oz updates zero state empty changelog new conversation agent what's new use agent footer toolbar layout chip chips rearrange re-arrange thinking expanded reasoning collapse never show hide conversation history feedback skill bundled github issue"
+        "other oz updates zero state empty changelog new conversation agent what's new use agent footer toolbar layout chip chips rearrange re-arrange thinking expanded reasoning collapse never show orchestration messages child agents collapse expand hide conversation history"
     }
 
     fn render(
@@ -6169,20 +7031,6 @@ impl SettingsWidget for OtherAIWidget {
             &view.local_only_icon_tooltip_states,
             app,
         ));
-        column.add_child(render_ai_setting_toggle::<FeedbackBundledSkillEnabled>(
-            "Enable built-in feedback skill",
-            AISettingsPageAction::ToggleFeedbackBundledSkill,
-            *ai_settings.feedback_bundled_skill_enabled,
-            is_toggleable,
-            self.feedback_bundled_skill_toggle.clone(),
-            &view.local_only_icon_tooltip_states,
-            app,
-        ));
-        column.add_child(render_ai_setting_description(
-            "Let Oz use Warp's built-in skill for turning Warp product feedback into GitHub issues.",
-            is_toggleable,
-            app,
-        ));
 
         column.add_child(render_dropdown_item(
             appearance,
@@ -6197,6 +7045,21 @@ impl SettingsWidget for OtherAIWidget {
             ),
             (!is_any_ai_enabled).then(|| appearance.theme().disabled_ui_text_color()),
             &view.thinking_display_mode_dropdown,
+        ));
+
+        column.add_child(render_dropdown_item(
+            appearance,
+            "Orchestration message display",
+            Some("Controls whether orchestration messages stay expanded."),
+            None,
+            LocalOnlyIconState::for_setting(
+                OrchestrationMessageDisplayMode::storage_key(),
+                OrchestrationMessageDisplayMode::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            (!is_any_ai_enabled).then(|| appearance.theme().disabled_ui_text_color()),
+            &view.orchestration_message_display_mode_dropdown,
         ));
 
         // TODO: OpenConversationLayoutPreference should not depend on local_fs, but it lives under the external editor settings
@@ -6237,13 +7100,14 @@ struct CLIAgentWidget {
     auto_toggle_rich_input_info_tooltip: MouseStateHandle,
     auto_open_rich_input_on_cli_agent_start_toggle: SwitchStateHandle,
     auto_dismiss_rich_input_toggle: SwitchStateHandle,
+    submit_on_ctrl_enter_toggle: SwitchStateHandle,
 }
 
 impl SettingsWidget for CLIAgentWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "third party cli coding agent claude codex gemini toolbar footer layout chip chips rearrange re-arrange bar command regex auto show rich input dismiss"
+        "third party cli coding agent claude codex gemini toolbar footer layout chip chips rearrange re-arrange bar command regex auto show rich input dismiss ctrl enter submit newline"
     }
 
     fn render(
@@ -6313,7 +7177,7 @@ impl SettingsWidget for CLIAgentWidget {
             use super::settings_page::AdditionalInfo;
             use crate::settings::{
                 AutoDismissRichInputAfterSubmit, AutoOpenRichInputOnCLIAgentStart,
-                AutoToggleRichInput,
+                AutoToggleRichInput, SubmitRichInputOnCtrlEnter,
             };
 
             if FeatureFlag::CLIAgentRichInput.is_enabled() {
@@ -6370,6 +7234,17 @@ impl SettingsWidget for CLIAgentWidget {
                     *ai_settings.auto_dismiss_rich_input_after_submit,
                     true,
                     self.auto_dismiss_rich_input_toggle.clone(),
+                    &view.local_only_icon_tooltip_states,
+                    app,
+                ));
+
+                // Setting 3: Submit Rich Input with Ctrl+Enter
+                column.add_child(render_ai_setting_toggle::<SubmitRichInputOnCtrlEnter>(
+                    "Submit Rich Input with Ctrl+Enter",
+                    AISettingsPageAction::ToggleSubmitRichInputOnCtrlEnter,
+                    *ai_settings.submit_on_ctrl_enter,
+                    true,
+                    self.submit_on_ctrl_enter_toggle.clone(),
                     &view.local_only_icon_tooltip_states,
                     app,
                 ));
@@ -6655,7 +7530,9 @@ impl SettingsWidget for CloudAgentComputerUseWidget {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        use crate::ai::execution_profiles::{CloudAgentComputerUseState, ComputerUsePermission};
+        use crate::ai::execution_profiles::{
+            resolve_cloud_agent_computer_use_state, CloudAgentComputerUseState,
+        };
 
         let is_any_ai_enabled = AISettings::as_ref(app).is_any_ai_enabled(app);
 
@@ -6663,7 +7540,7 @@ impl SettingsWidget for CloudAgentComputerUseWidget {
         let CloudAgentComputerUseState {
             enabled: is_checked,
             is_forced_by_org,
-        } = ComputerUsePermission::resolve_cloud_agent_state(app);
+        } = resolve_cloud_agent_computer_use_state(app);
 
         // Toggle is disabled if forced by org settings OR if AI is globally disabled
         let is_disabled = is_forced_by_org || !is_any_ai_enabled;
@@ -6905,6 +7782,12 @@ struct ApiKeysWidget {
     openai_api_key_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
     google_api_key_editor: ViewHandle<EditorView>,
+    /// Buttons for the SuperGrok (xAI) subscription row; which one renders
+    /// depends on whether OAuth tokens are stored or a connect attempt is in
+    /// progress.
+    grok_connect_button: ViewHandle<ActionButton>,
+    grok_connecting_button: ViewHandle<ActionButton>,
+    grok_disconnect_button: ViewHandle<ActionButton>,
 
     can_use_warp_credits_for_fallback: SwitchStateHandle,
     upgrade_highlight_index: HighlightedHyperlink,
@@ -7013,10 +7896,83 @@ impl ApiKeysWidget {
             "AIzaSy..."
         );
 
+        // Editor text colors are snapshotted at construction via
+        // `text_colors_override`, so refresh them whenever the theme changes.
+        let api_key_editors = [
+            openai_api_key_editor.clone(),
+            anthropic_api_key_editor.clone(),
+            google_api_key_editor.clone(),
+        ];
+        ctx.subscribe_to_model(&Appearance::handle(ctx), move |_, _, event, ctx| {
+            if let AppearanceEvent::ThemeChanged = event {
+                let text_colors = editor_text_colors(Appearance::as_ref(ctx));
+                for editor in &api_key_editors {
+                    let colors = text_colors.clone();
+                    editor.update(ctx, move |editor, ctx| {
+                        editor.set_text_colors(colors, ctx);
+                    });
+                }
+            }
+        });
+
+        let grok_connect_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Connect", SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::ConnectGrokSubscription);
+                })
+        });
+        let grok_connecting_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Connecting", SecondaryTheme).with_size(ButtonSize::Small)
+        });
+        grok_connecting_button.update(ctx, |button, ctx| {
+            button.set_disabled(true, ctx);
+        });
+        let grok_disconnect_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Disconnect", DangerSecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::DisconnectGrokSubscription);
+                })
+        });
+        for button in [&grok_connect_button, &grok_disconnect_button] {
+            button.update(ctx, |button, ctx| {
+                button.set_disabled(!(is_any_ai_enabled && is_byo_enabled), ctx);
+            });
+        }
+
+        // The Grok subscription is BYO auth, so keep the buttons' enablement
+        // in sync with the BYO API key policy, like the editors above.
+        let grok_buttons = [grok_connect_button.clone(), grok_disconnect_button.clone()];
+        ctx.subscribe_to_model(&workspace_handle, move |_, workspace, event, ctx| {
+            if let UserWorkspacesEvent::TeamsChanged = event {
+                let is_any_ai_enabled = AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx);
+                let is_byo_enabled = workspace.as_ref(ctx).is_byo_api_key_enabled(ctx);
+                for button in &grok_buttons {
+                    button.update(ctx, |button, ctx| {
+                        button.set_disabled(!(is_any_ai_enabled && is_byo_enabled), ctx);
+                    });
+                }
+                ctx.notify();
+            }
+        });
+
+        // Re-render the SuperGrok row whenever the stored tokens change (the
+        // connect flow completes, a disconnect, or a background refresh).
+        ctx.subscribe_to_model(&ApiKeyManager::handle(ctx), |_, _, event, ctx| {
+            if matches!(event, ApiKeyManagerEvent::KeysUpdated) {
+                ctx.notify();
+            }
+        });
+
         Self {
             openai_api_key_editor,
             anthropic_api_key_editor,
             google_api_key_editor,
+
+            grok_connect_button,
+            grok_connecting_button,
+            grok_disconnect_button,
 
             can_use_warp_credits_for_fallback: Default::default(),
             upgrade_highlight_index: Default::default(),
@@ -7100,12 +8056,9 @@ impl ApiKeysWidget {
         let appearance = Appearance::as_ref(app);
         let text_fragments = vec![
             FormattedTextFragment::plain_text(
-                "Use your own API keys from model providers for Warp Agent. You can also add custom endpoints to use third-party models. Custom endpoints must support the OpenAI-compatible Chat Completions API. API keys are stored locally and are never synced to the cloud. Using auto models or models from providers you have not provided API keys for will consume Warp credits. ",
+                "Use your own API keys from model providers for Warp Agent. You can also add custom endpoints to use third-party models. Custom endpoints must support the OpenAI-compatible Chat Completions API. API keys are stored only on your device, never on Warp's servers. They're used to make requests to your chosen model provider. Using auto models or models from providers you have not provided API keys for will consume Warp credits. ",
             ),
-            FormattedTextFragment::hyperlink(
-                "Learn more",
-                CUSTOM_INFERENCE_LEARN_MORE_URL,
-            ),
+            FormattedTextFragment::hyperlink("Learn more", CUSTOM_INFERENCE_LEARN_MORE_URL),
         ];
         let description = FormattedTextElement::new(
             FormattedText::new([FormattedTextLine::Line(text_fragments)]),
@@ -7143,10 +8096,7 @@ impl ApiKeysWidget {
             FormattedTextFragment::plain_text(
                 "By using BYOK or custom endpoints, you agree to use them only as permitted by ",
             ),
-            FormattedTextFragment::hyperlink(
-                "Warp's Terms of Service",
-                CUSTOM_INFERENCE_TERMS_URL,
-            ),
+            FormattedTextFragment::hyperlink("Warp's Terms of Service", CUSTOM_INFERENCE_TERMS_URL),
             FormattedTextFragment::plain_text(
                 ". BYOK and custom endpoints are intended for individual use and small teams. Companies or organizations with more than 10 employees should use Warp Business or Enterprise.",
             ),
@@ -7275,6 +8225,155 @@ impl ApiKeysWidget {
         list.finish()
     }
 
+    /// The "Connect SuperGrok subscription" row: label and description on the
+    /// left, a Connect/Disconnect button on the right, and a "Connected on
+    /// ..." status line underneath while a subscription is connected.
+    fn render_grok_subscription_row(
+        &self,
+        appearance: &Appearance,
+        is_enabled: bool,
+        is_connecting: bool,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let grok_tokens = ApiKeyManager::as_ref(app).grok_tokens();
+
+        let text_color = styles::header_font_color(is_enabled, app);
+        let label = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.)
+            .with_child(
+                Text::new_inline("Use your", appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                    .with_color(text_color.into())
+                    .finish(),
+            )
+            .with_child(
+                ConstrainedBox::new(Icon::XLogo.to_warpui_icon(text_color).finish())
+                    .with_width(14.)
+                    .with_height(14.)
+                    .finish(),
+            )
+            .with_child(
+                Text::new_inline(
+                    "Premium or SuperGrok subscription",
+                    appearance.ui_font_family(),
+                    CONTENT_FONT_SIZE,
+                )
+                .with_color(text_color.into())
+                .finish(),
+            )
+            .finish();
+
+        let button = if grok_tokens.is_some() {
+            &self.grok_disconnect_button
+        } else if is_connecting {
+            &self.grok_connecting_button
+        } else {
+            &self.grok_connect_button
+        };
+
+        let header_row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(Shrinkable::new(1., label).finish())
+            .with_child(button.as_ref(app).render(app))
+            .finish();
+
+        let description = Container::new(
+            Text::new(
+                "Connect your SuperGrok subscription to use Grok models in the Warp Agent through your xAI account.",
+                appearance.ui_font_family(),
+                CONTENT_FONT_SIZE,
+            )
+            .with_color(styles::description_font_color(is_enabled, app).into())
+            .soft_wrap(true)
+            .finish(),
+        )
+        .with_margin_right(styles::TOGGLE_WIDTH_MARGIN)
+        .finish();
+
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_child(header_row)
+            .with_child(description);
+
+        if let Some(tokens) = grok_tokens {
+            let connected_text = match tokens.connected_at.map(DateTime::<Local>::from) {
+                Some(connected_at) => format!(
+                    "Connected on {}.",
+                    connected_at.format("%m/%d/%Y at %-I:%M%P")
+                ),
+                // Tokens stored before the connection time was tracked.
+                None => "Connected.".to_string(),
+            };
+            let check = ConstrainedBox::new(
+                Icon::Check
+                    .to_warpui_icon(appearance.theme().ansi_fg_green().into())
+                    .finish(),
+            )
+            .with_width(12.)
+            .with_height(12.)
+            .finish();
+            let status_text = Text::new_inline(
+                connected_text,
+                appearance.ui_font_family(),
+                CONTENT_FONT_SIZE,
+            )
+            .with_color(styles::description_font_color(is_enabled, app).into())
+            .finish();
+            column.add_child(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(4.)
+                    .with_child(check)
+                    .with_child(status_text)
+                    .finish(),
+            );
+        }
+
+        column.finish()
+    }
+
+    /// Paste-the-code fallback for the current SuperGrok connect attempt.
+    #[cfg(not(target_family = "wasm"))]
+    fn render_grok_manual_code_entry(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+
+        let editor_style = UiComponentStyles {
+            padding: Some(Coords {
+                top: 10.,
+                bottom: 10.,
+                left: 16.,
+                right: 16.,
+            }),
+            background: Some(theme.surface_2().into()),
+            ..Default::default()
+        };
+        let input = appearance
+            .ui_builder()
+            .text_input(view.grok_code_editor.clone())
+            .with_style(editor_style)
+            .build()
+            .finish();
+
+        let row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(8.)
+            .with_child(Shrinkable::new(1., input).finish())
+            .finish();
+
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_spacing(8.)
+            .with_child(row)
+            .finish()
+    }
+
     fn render_warp_credit_fallback_toggle(
         &self,
         view: &AISettingsPageView,
@@ -7309,7 +8408,7 @@ impl SettingsWidget for ApiKeysWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt custom inference endpoint"
+        "api keys bring your own byo openai anthropic google claude gemini gpt custom inference endpoint grok supergrok xai subscription"
     }
 
     fn render(
@@ -7409,6 +8508,37 @@ impl SettingsWidget for ApiKeysWidget {
                     custom_inference_controls_enabled,
                     app,
                 ));
+            }
+        }
+
+        // Entrypoint for connecting a SuperGrok (xAI) subscription via OAuth.
+        if FeatureFlag::SuperGrok.is_enabled() {
+            #[cfg(not(target_family = "wasm"))]
+            let grok_tokens = ApiKeyManager::as_ref(app).grok_tokens();
+            #[cfg(not(target_family = "wasm"))]
+            let has_grok_oauth_attempt = view.grok_oauth_attempt.is_some();
+            #[cfg(not(target_family = "wasm"))]
+            let is_grok_connecting = grok_tokens.is_none() && has_grok_oauth_attempt;
+            #[cfg(target_family = "wasm")]
+            let is_grok_connecting = false;
+            column.add_child(
+                Container::new(self.render_grok_subscription_row(
+                    appearance,
+                    provider_keys_enabled,
+                    is_grok_connecting,
+                    app,
+                ))
+                .with_margin_top(16.)
+                .finish(),
+            );
+
+            #[cfg(not(target_family = "wasm"))]
+            if has_grok_oauth_attempt {
+                column.add_child(
+                    Container::new(self.render_grok_manual_code_entry(view, appearance))
+                        .with_margin_top(8.)
+                        .finish(),
+                );
             }
         }
 
@@ -7938,6 +9068,104 @@ impl SettingsWidget for AwsBedrockWidget {
         Container::new(column.finish())
             .with_margin_bottom(HEADER_PADDING)
             .finish()
+    }
+}
+
+#[derive(Default)]
+struct CustomModelRoutersWidget;
+
+impl SettingsWidget for CustomModelRoutersWidget {
+    type View = AISettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "custom model router complexity prompt auto model routing"
+    }
+
+    fn should_render(&self, _app: &AppContext) -> bool {
+        FeatureFlag::CustomModelRouters.is_enabled()
+    }
+
+    #[cfg_attr(not(feature = "local_fs"), allow(unused_variables))]
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let is_any_ai_enabled = AISettings::as_ref(app).is_any_ai_enabled(app);
+        let header_color = styles::header_font_color(is_any_ai_enabled, app);
+
+        // Header row: "Custom Model Routers" + add button
+        let header_row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                warpui::elements::Shrinkable::new(
+                    1.,
+                    build_sub_header(appearance, "Custom Model Routers", Some(header_color))
+                        .finish(),
+                )
+                .finish(),
+            )
+            .with_child({
+                #[cfg(feature = "local_fs")]
+                {
+                    warpui::elements::Container::new(view.add_router_button.as_ref(app).render(app))
+                        .with_margin_left(16.)
+                        .finish()
+                }
+                #[cfg(not(feature = "local_fs"))]
+                {
+                    warpui::elements::Empty::new().finish()
+                }
+            })
+            .finish();
+
+        let column = Flex::column()
+            .with_child(render_separator(appearance))
+            .with_child(
+                Container::new(header_row)
+                    .with_padding_bottom(HEADER_PADDING)
+                    .finish(),
+            )
+            .with_child(render_ai_setting_description(
+                "Create named model routers that automatically pick the right model based on task complexity or prompt content.",
+                is_any_ai_enabled,
+                app,
+            ));
+
+        // Error cards and router summary cards (local_fs only)
+        #[cfg(feature = "local_fs")]
+        let column = {
+            use super::custom_router_view::render_router_error_card;
+            use crate::user_config::WarpConfig;
+            let mut c = column;
+            // Error cards (files that failed to parse) — shown first
+            let errors = WarpConfig::as_ref(app).custom_model_router_errors();
+            for error in errors.iter() {
+                c.add_child(
+                    Container::new(render_router_error_card(
+                        &error.file_name,
+                        &error.error_message,
+                        appearance,
+                    ))
+                    .with_margin_top(8.)
+                    .finish(),
+                );
+            }
+            // Router summary cards
+            for view_handle in &view.router_views {
+                c.add_child(
+                    Container::new(warpui::elements::ChildView::new(view_handle).finish())
+                        .with_margin_top(8.)
+                        .finish(),
+                );
+            }
+            c
+        };
+
+        column.finish()
     }
 }
 

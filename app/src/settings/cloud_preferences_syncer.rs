@@ -3,13 +3,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cloud_object_models::JsonSerializer;
 use lazy_static::lazy_static;
 use settings::{Setting as _, SyncToCloud};
 use warp_core::execution_mode::AppExecutionMode;
+use warp_core::r#async::debounce;
 use warp_core::settings::ChangeEventReason;
 use warp_core::user_preferences::GetUserPreferences;
 use warpui::r#async::Timer;
-use warpui::{Entity, ModelContext, SingletonEntity};
+use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity};
 use warpui_extras::user_preferences::toml_backed::TomlBackedUserPreferences;
 
 use super::cloud_preferences::{CloudPreferencesSettings, CloudPreferencesSettingsChangedEvent};
@@ -17,10 +19,8 @@ use super::manager::SettingsEvent;
 use super::PrivacySettings;
 use crate::auth::auth_state::AuthState;
 use crate::cloud_object::model::generic_string_model::GenericStringObjectId;
-use crate::cloud_object::model::json_model::JsonSerializer;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::cloud_object::{CloudObjectEventEntrypoint, GenericStringObjectFormat, JsonObjectType};
-use crate::debounce::debounce;
 use crate::drive::CloudObjectTypeAndId;
 use crate::report_if_error;
 use crate::server::cloud_objects::update_manager::{
@@ -203,7 +203,7 @@ impl CloudPreferencesSyncer {
         // handle_initial_load. This prevents the CloudPreferencesUpdated event (which fires
         // synchronously in on_changed_objects_fetched) from overwriting local settings
         // before handle_initial_load has a chance to determine sync direction.
-        ctx.subscribe_to_model(&UpdateManager::handle(ctx), |syncer, event, ctx| {
+        ctx.subscribe_to_model(&UpdateManager::handle(ctx), |syncer, _, event, ctx| {
             if let UpdateManagerEvent::CloudPreferencesUpdated { updated } = event {
                 // Defer cloud→local updates until `handle_initial_load`
                 // has determined the correct sync direction. The
@@ -230,7 +230,7 @@ impl CloudPreferencesSyncer {
         );
         ctx.subscribe_to_model(
             &SettingsManager::handle(ctx),
-            |me, event, ctx| match event {
+            |me, _, event, ctx| match event {
                 SettingsEvent::LocalPreferencesUpdated { storage_key, .. } => {
                     me.handle_local_preference_updated(storage_key, ctx);
                 }
@@ -245,7 +245,7 @@ impl CloudPreferencesSyncer {
         ctx.subscribe_to_model(&SyncQueue::handle(ctx), Self::handle_sync_queue_event);
         ctx.subscribe_to_model(
             &CloudPreferencesSettings::handle(ctx),
-            |me, event, ctx| match event {
+            |me, _, event, ctx| match event {
                 CloudPreferencesSettingsChangedEvent::IsSettingsSyncEnabled {
                     change_event_reason,
                 } => {
@@ -285,7 +285,12 @@ impl CloudPreferencesSyncer {
     /// Handles SyncQueue success events by updating the stored
     /// settings file hash when a cloud preference is successfully
     /// created or updated on the server.
-    fn handle_sync_queue_event(&mut self, event: &SyncQueueEvent, ctx: &mut ModelContext<Self>) {
+    fn handle_sync_queue_event(
+        &mut self,
+        _: ModelHandle<SyncQueue>,
+        event: &SyncQueueEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
         let server_id = match event {
             SyncQueueEvent::ObjectCreationSuccessful {
                 server_creation_info,

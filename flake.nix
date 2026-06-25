@@ -166,7 +166,6 @@
 
       buildFeatures = [
         "release_bundle"
-        "ssh_tmux_wrapper"
         "gui"
       ];
 

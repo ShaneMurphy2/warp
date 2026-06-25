@@ -27,12 +27,21 @@ impl ActiveSession {
         model_event_dispatcher: ModelHandle<ModelEventDispatcher>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        ctx.subscribe_to_model(&model_event_dispatcher, move |me, event, ctx| {
-            if let ModelEvent::BlockMetadataReceived(block_metadata_received_event) = event {
-                let new_pwd = block_metadata_received_event
-                    .block_metadata
-                    .current_working_directory()
-                    .map(|cwd| cwd.to_owned());
+        ctx.subscribe_to_model(&model_event_dispatcher, move |me, _, event, ctx| {
+            let new_pwd = match event {
+                ModelEvent::BlockMetadataReceived(e) => Some(
+                    e.block_metadata
+                        .current_working_directory()
+                        .map(|cwd| cwd.to_owned()),
+                ),
+                ModelEvent::BlockWorkingDirectoryUpdated(e) => Some(
+                    e.block_metadata
+                        .current_working_directory()
+                        .map(|cwd| cwd.to_owned()),
+                ),
+                _ => None,
+            };
+            if let Some(new_pwd) = new_pwd {
                 if me.current_working_directory != new_pwd {
                     me.current_working_directory = new_pwd;
                     ctx.emit(ActiveSessionEvent::UpdatedPwd);
@@ -40,7 +49,7 @@ impl ActiveSession {
             }
         });
 
-        ctx.subscribe_to_model(&sessions, |me, event, ctx| {
+        ctx.subscribe_to_model(&sessions, |me, _, event, ctx| {
             if let SessionsEvent::SessionBootstrapped(bootstrap_event) = event {
                 if Some(bootstrap_event.session_id)
                     == me.model_event_dispatcher.as_ref(ctx).active_session_id()

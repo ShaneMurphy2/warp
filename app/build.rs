@@ -37,13 +37,10 @@ fn main() -> Result<()> {
         println!("cargo:rustc-link-lib=framework=UserNotifications");
         build_and_link_sentry();
 
-        println!("cargo:rerun-if-changed=src/platform/mac/objc/app_bundle.h");
-        println!("cargo:rerun-if-changed=src/platform/mac/objc/app_bundle.m");
         println!("cargo:rerun-if-changed=src/platform/mac/objc/services.h");
         println!("cargo:rerun-if-changed=src/platform/mac/objc/services.m");
 
         cc::Build::new()
-            .file("src/platform/mac/objc/app_bundle.m")
             .file("src/platform/mac/objc/services.m")
             .compile("warp_objc");
 
@@ -278,6 +275,14 @@ fn build_and_link_sentry() {
             "cargo:rustc-link-search=all={}",
             swift_library_path.display()
         );
+        // Embed /usr/lib/swift as LC_RPATH so the deployed standalone CLI binary can
+        // find Swift runtime dylibs on the remote host. On macOS 12.3+, Apple ships
+        // the Swift runtime as an OS-level framework at /usr/lib/swift. Without this,
+        // remote macOS hosts fail with:
+        //   dyld: Library not loaded: @rpath/libswiftCore.dylib
+        //   Reason: no LC_RPATH's found
+        // See: https://github.com/warpdotdev/warp/issues/12631
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     }
 
     compile_sentry_objc_lib(&sentry_framework_path);

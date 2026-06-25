@@ -327,7 +327,7 @@ pub struct CurrentDraggingState {
     pub current_location: ChipLocation,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ChipConfiguratorAction {
     StartDraggingChip { location: ChipLocation },
     DragChip { current_position: RectF },
@@ -418,6 +418,15 @@ impl ChipConfigurator {
         self.right_chips.clear();
         self.unused_chips.clear();
         self.current_dragging_state = None;
+    }
+
+    /// Whether any zone currently holds chips (i.e. the configurator is open /
+    /// populated).
+    pub fn has_items(&self) -> bool {
+        !self.used_chips.is_empty()
+            || !self.left_chips.is_empty()
+            || !self.right_chips.is_empty()
+            || !self.unused_chips.is_empty()
     }
 
     pub fn left_item_kinds(&self) -> Vec<AgentToolbarItemKind> {

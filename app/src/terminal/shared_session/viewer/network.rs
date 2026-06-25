@@ -23,12 +23,12 @@ use session_sharing_protocol::common::{
     UpdatePendingUserRoleResponse, UserID, WindowSize, WriteToPtyFailureReason,
     WriteToPtyRequestId, WriteToPtySeqNo,
 };
-use session_sharing_protocol::sharer::SessionSourceType;
 use session_sharing_protocol::viewer::{
     DownstreamMessage, InitPayload, RoleUpdatedReason, SessionEndedReason, UpstreamMessage,
     ViewerRemovedReason,
 };
 use warp_core::features::FeatureFlag;
+use warp_server_client::iap::IapManager;
 use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::{
     Entity, ModelContext, ModelHandle, RequestState, RetryOption, SingletonEntity, WeakViewHandle,
@@ -43,11 +43,13 @@ use crate::server::server_api::ServerApiProvider;
 use crate::server::telemetry::telemetry_context;
 use crate::terminal::event_listener::ChannelEventListener;
 use crate::terminal::model::block::BlockId;
-use crate::terminal::shared_session::network::heartbeat::{Event as HeartbeatEvent, Heartbeat};
+use crate::terminal::shared_session::shared_handlers::RemoteUpdateGuard;
 use crate::terminal::shared_session::viewer::event_loop::{
     EventLoop, SharedSessionInitialLoadMode,
 };
-use crate::terminal::shared_session::{connect_endpoint, EventNumber, SELECTION_THROTTLE_PERIOD};
+use crate::terminal::shared_session::{
+    connect_endpoint, EventNumber, SharedSessionSource, SELECTION_THROTTLE_PERIOD,
+};
 use crate::terminal::{TerminalModel, TerminalView};
 use crate::throttle::throttle;
 
@@ -105,8 +107,6 @@ struct CachedLatestState {
 /// The network interface to allow communication to and from the
 /// cloud-backed shared session.
 pub struct Network {
-    heartbeat: ModelHandle<Heartbeat>,
-
     session_id: SessionId,
     /// [`None`] until the viewer receives the successful join ack.
     event_loop: Option<ModelHandle<EventLoop>>,
@@ -116,6 +116,7 @@ pub struct Network {
     channel_event_proxy: ChannelEventListener,
     terminal_model: Arc<FairMutex<TerminalModel>>,
     initial_load_mode: SharedSessionInitialLoadMode,
+    remote_update_guard: RemoteUpdateGuard,
 
     stage: Stage,
 
@@ -145,6 +146,7 @@ pub struct Network {
 }
 
 impl Network {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         channel_event_proxy: ChannelEventListener,
@@ -152,16 +154,13 @@ impl Network {
         terminal_model: Arc<FairMutex<TerminalModel>>,
         write_to_pty_events_rx: Receiver<Vec<u8>>,
         initial_load_mode: SharedSessionInitialLoadMode,
+        remote_update_guard: RemoteUpdateGuard,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
         let (selection_throttled_tx, selection_rx) = async_channel::unbounded();
         let selection_throttled_rx = throttle(SELECTION_THROTTLE_PERIOD, selection_rx);
-        let heartbeat = ctx.add_model(|_| Heartbeat::default());
-        ctx.subscribe_to_model(&heartbeat, Self::handle_heartbeat_event);
-
         let model = Network {
-            heartbeat,
             session_id,
             event_loop: None,
             ws_proxy_tx,
@@ -170,6 +169,7 @@ impl Network {
             channel_event_proxy,
             terminal_model,
             initial_load_mode,
+            remote_update_guard,
             terminal_view,
             stage: Stage::BeforeJoined,
             id: None,
@@ -209,6 +209,7 @@ impl Network {
         terminal_view: WeakViewHandle<TerminalView>,
         terminal_model: Arc<FairMutex<TerminalModel>>,
         write_to_pty_events_rx: Receiver<Vec<u8>>,
+        remote_update_guard: RemoteUpdateGuard,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         use session_sharing_protocol::common::SessionId;
@@ -216,16 +217,12 @@ impl Network {
         let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
         let (selection_throttled_tx, selection_rx) = async_channel::unbounded();
         let selection_throttled_rx = throttle(SELECTION_THROTTLE_PERIOD, selection_rx);
-        let heartbeat = ctx.add_model(|_| Heartbeat::default());
-        ctx.subscribe_to_model(&heartbeat, Self::handle_heartbeat_event);
-
         let session_id = SessionId::new();
         let viewer_id = ParticipantId::new();
         let viewer_firebase_uid = UserUid::new("mock_firebase_uid");
         let active_prompt = ActivePrompt::WarpPrompt("test warp prompt".to_owned());
 
         let model = Network {
-            heartbeat,
             session_id,
             event_loop: None,
             ws_proxy_tx,
@@ -233,6 +230,7 @@ impl Network {
             channel_event_proxy,
             terminal_model,
             initial_load_mode: SharedSessionInitialLoadMode::ReplaceFromSessionScrollback,
+            remote_update_guard,
             terminal_view,
             stage: Stage::BeforeJoined,
             id: Some(viewer_id.clone()),
@@ -256,7 +254,7 @@ impl Network {
             participant_list: Default::default(),
             input_replica_id: ReplicaId::random(),
             universal_developer_input_context: None,
-            source_type: SessionSourceType::default(),
+            source: SharedSessionSource::default(),
         });
 
         model.start_write_to_pty_events_listener(write_to_pty_events_rx, ctx);
@@ -272,21 +270,6 @@ impl Network {
             |_, _| {},
         );
         model
-    }
-
-    /// We need to ensure we're maintaining a heartbeat with the server.
-    /// This helps us detect if the server has gone away silently and helps
-    /// the server detect if we (the client) have disconnected quietly.
-    fn handle_heartbeat_event(&mut self, event: &HeartbeatEvent, ctx: &mut ModelContext<Self>) {
-        match event {
-            HeartbeatEvent::Ping => {
-                self.send_message_to_server(UpstreamMessage::Ping { data: vec![] });
-            }
-            HeartbeatEvent::Idle => {
-                log::info!("Viewer reconnecting: heartbeat idle timeout");
-                self.reconnect_websocket(ctx);
-            }
-        }
     }
 
     async fn get_user_id(
@@ -308,12 +291,15 @@ impl Network {
         session_id: SessionId,
         auth_client: Arc<dyn AuthClient>,
         auth_state: Arc<AuthState>,
+        iap_headers: Vec<(&'static str, String)>,
     ) -> anyhow::Result<((impl Sink, impl Stream), UserID)> {
         let Some(join_endpoint) = connect_endpoint(format!("/sessions/join/{session_id}")) else {
             bail!("This channel does not support session-sharing.");
         };
         let user_id = Self::get_user_id(auth_client, &auth_state).await?;
-        let socket = websocket::WebSocket::connect(join_endpoint, None /* protocols */).await?;
+        let socket =
+            websocket::WebSocket::connect_with_headers(&join_endpoint, None::<&str>, iap_headers)
+                .await?;
         anyhow::Ok(((socket.split().await), user_id))
     }
 
@@ -324,18 +310,11 @@ impl Network {
         stream: impl Stream,
         ctx: &mut ModelContext<Self>,
     ) {
-        self.heartbeat.update(ctx, |heartbeat, ctx| {
-            heartbeat.start(ctx);
-        });
-
         // Receive messages from the server.
         ctx.spawn_stream_local(
             stream,
             |network, item, ctx| match item {
                 Ok(message) => {
-                    network.heartbeat.update(ctx, |heartbeat, ctx| {
-                        heartbeat.reset_idle_timeout(ctx);
-                    });
                     network.process_websocket_message(message, ctx);
                 }
                 Err(e) => {
@@ -344,13 +323,13 @@ impl Network {
             },
             |network, ctx| {
                 log::info!("Websocket to session sharing server ended");
-                // Close our current websocket proxy, because we may try to reconnect and that will create a new websocket proxy.
-                // This must be done before trying to reconnect.
-                network.close();
                 if matches!(network.stage, Stage::JoinedSuccessfully) {
                     // The connection may have timed out or the server restarted.
                     log::info!("Viewer reconnecting: websocket closed by server");
                     network.reconnect_websocket(ctx);
+                } else if !matches!(network.stage, Stage::Reconnecting { .. }) {
+                    // Not reconnecting — clean up the proxy channel.
+                    network.close();
                 }
             },
         );
@@ -385,10 +364,20 @@ impl Network {
     ) {
         let auth_client = ServerApiProvider::as_ref(ctx).get_auth_client();
         let auth_state = AuthStateProvider::as_ref(ctx).get().clone();
+        let iap_headers: Vec<(&'static str, String)> = IapManager::as_ref(ctx)
+            .iap_state()
+            .and_then(|state| state.proxy_auth_header())
+            .into_iter()
+            .collect();
         // Open a websocket to the server to join the session.
         ctx.spawn(
-            Self::connect_websocket_and_get_user_id(session_id, auth_client, auth_state.clone()),
-            |network, conn, ctx| match conn {
+            Self::connect_websocket_and_get_user_id(
+                session_id,
+                auth_client,
+                auth_state.clone(),
+                iap_headers,
+            ),
+            move |network, conn, ctx| match conn {
                 Ok(((sink, stream), user_id)) => {
                     let initialize_message = UpstreamMessage::Initialize(InitPayload {
                         viewer_id: network.id.clone(),
@@ -410,7 +399,13 @@ impl Network {
                     network.on_websocket_connected(ws_proxy_rx, sink, stream, ctx)
                 }
                 Err(e) => {
-                    log::error!("Failed to join shared session: {e}");
+                    log::error!(
+                        "viewer Network::start_websocket: WS connect FAILED for \
+                         session_id={session_id}: {e:#}; emitting FailedToJoin (no automatic retry)"
+                    );
+                    IapManager::handle(ctx).update(ctx, |manager, ctx| {
+                        manager.check_ws_connect_error(&e, ctx);
+                    });
                     ctx.emit(NetworkEvent::FailedToJoin {
                         reason: FailedToJoinReason::FailedToConnectToServer,
                     });
@@ -428,6 +423,11 @@ impl Network {
         if matches!(self.stage, Stage::Finished | Stage::Reconnecting { .. }) {
             return;
         }
+        // Close the old connection before reconnecting so the server sees
+        // WebsocketClosed immediately rather than waiting for its own idle
+        // timer. Stage is guaranteed not Reconnecting here, so close() will
+        // not abort any in-progress reconnect handle.
+        self.close();
         let Some(event_loop) = self.event_loop.clone() else {
             log::error!("Cannot reconnect to server as viewer when event loop does not exist");
             return;
@@ -435,10 +435,23 @@ impl Network {
         let session_id = self.session_id;
         let auth_client = ServerApiProvider::as_ref(ctx).get_auth_client();
         let auth_state = AuthStateProvider::as_ref(ctx).get().clone();
+        let iap_state = IapManager::as_ref(ctx).iap_state();
         let abort_handle = ctx.spawn_with_retry_on_error(
             move || {
                 log::info!("Attempting to reconnect to session sharing server as viewer");
-                Self::connect_websocket_and_get_user_id(session_id, auth_client.clone(), auth_state.clone())
+                // Re-read the IAP header each attempt so a refresh that landed
+                // since the last try is picked up (staging only).
+                let iap_headers: Vec<(&'static str, String)> = iap_state
+                    .as_ref()
+                    .and_then(|state| state.proxy_auth_header())
+                    .into_iter()
+                    .collect();
+                Self::connect_websocket_and_get_user_id(
+                    session_id,
+                    auth_client.clone(),
+                    auth_state.clone(),
+                    iap_headers,
+                )
             },
             RECONNECT_RETRY_STRATEGY,
             move |network, conn, ctx| match conn {
@@ -468,6 +481,9 @@ impl Network {
                     network.on_websocket_connected(ws_proxy_rx, sink, stream, ctx)
                 }
                 RequestState::RequestFailedRetryPending(e) => {
+                    IapManager::handle(ctx).update(ctx, |manager, ctx| {
+                        manager.check_ws_connect_error(&e, ctx);
+                    });
                     log::warn!("Failed to reconnect to shared session as viewer, will retry: {e}");
                 }
                 RequestState::RequestFailed(e) => {
@@ -485,10 +501,10 @@ impl Network {
 
     /// Fetches the new user id and reconnectes to the websocket.
     pub fn reauthenticate_viewer(&mut self, ctx: &mut ModelContext<Self>) {
-        let server_api = ServerApiProvider::as_ref(ctx).get();
+        let auth_client = ServerApiProvider::as_ref(ctx).get_auth_client();
         let auth_state = AuthStateProvider::as_ref(ctx).get().clone();
         ctx.spawn(
-            async move { Self::get_user_id(server_api, &auth_state).await },
+            async move { Self::get_user_id(auth_client, &auth_state).await },
             |network, res, ctx| match res {
                 Ok(user_id) => {
                     let message = UpstreamMessage::Reauthenticated { user_id };
@@ -504,10 +520,11 @@ impl Network {
     }
 
     fn process_websocket_message(&mut self, message: Message, ctx: &mut ModelContext<Self>) {
-        let Some(msg) = message
-            .text()
-            .and_then(|t| DownstreamMessage::from_json(t).ok())
-        else {
+        // Ignore non-text frames (e.g. ping frames sent by the server).
+        let Some(text) = message.text() else {
+            return;
+        };
+        let Some(msg) = DownstreamMessage::from_json(text).ok() else {
             log::warn!("Got unexpected message from shared session viewer websocket");
             return;
         };
@@ -525,15 +542,19 @@ impl Network {
                 // We use the more detailed source type here,
                 // ignoring the legacy source_type field (which was kept around for backwards compatibility).
                 detailed_source_type: source_type,
+                source_task_id,
                 ..
             } => {
+                let source = SharedSessionSource {
+                    source_type,
+                    source_task_id,
+                };
                 if matches!(self.stage, Stage::JoinedSuccessfully) {
                     log::warn!(
                         "Received unexpected JoinedSuccessfully message when we've already joined"
                     );
                     return;
                 }
-                log::info!("Successfully joined shared session.");
                 self.id = Some(viewer_id.clone());
                 self.stage = Stage::JoinedSuccessfully;
 
@@ -552,6 +573,7 @@ impl Network {
                         *scrollback,
                         latest_event_no,
                         self.initial_load_mode,
+                        self.remote_update_guard.clone(),
                         ctx,
                     )
                 });
@@ -563,7 +585,7 @@ impl Network {
                     participant_list: Box::new(*participant_list),
                     input_replica_id: input_replica_id.into(),
                     universal_developer_input_context,
-                    source_type,
+                    source,
                 });
             }
             DownstreamMessage::RejoinedSuccessfully { participant_list } => {
@@ -612,7 +634,13 @@ impl Network {
                 ));
             }
             DownstreamMessage::FailedToJoin { reason } => {
-                log::warn!("Failed to join shared session: {reason:?}");
+                log::warn!(
+                    "viewer Network: server replied FailedToJoin for \
+                     session_id={} reason={reason:?} stage={:?} (no automatic retry on initial \
+                     join failure)",
+                    self.session_id,
+                    std::mem::discriminant(&self.stage),
+                );
 
                 if let Stage::Reconnecting { abort_handle } = &self.stage {
                     abort_handle.abort();
@@ -1106,7 +1134,7 @@ pub enum NetworkEvent {
         participant_list: Box<ParticipantList>,
         input_replica_id: ReplicaId,
         universal_developer_input_context: Option<UniversalDeveloperInputContext>,
-        source_type: SessionSourceType,
+        source: SharedSessionSource,
     },
     FailedToJoin {
         reason: FailedToJoinReason,

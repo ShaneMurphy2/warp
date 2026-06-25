@@ -1454,7 +1454,7 @@ fn test_debounced_resizes() {
         let render_state = app.read(|ctx| model_handle.as_ref(ctx).render_state().clone());
         let model2 = render_state.clone();
         let _observer = app.add_model::<Observer, _>(move |ctx| {
-            ctx.subscribe_to_model(&model2, move |_, event, _| {
+            ctx.subscribe_to_model(&model2, move |_, _, event, _| {
                 block_on(events_tx.send(*event)).unwrap();
             });
             Observer {}
@@ -1850,17 +1850,17 @@ fn mock_server_workflow(id: i64, app: &mut App) {
         current_editor_uid: None,
     };
 
-    let workflow = ServerWorkflow {
-        id: SyncId::ServerId(workflow_id.into()),
-        metadata: server_metadata,
-        permissions: ServerPermissions {
+    let workflow = ServerWorkflow::new(
+        SyncId::ServerId(workflow_id.into()),
+        CloudWorkflowModel::new(Workflow::new(format!("w{id}"), format!("c{id}"))),
+        server_metadata,
+        ServerPermissions {
             space: Owner::mock_current_user(),
             guests: Vec::new(),
             permissions_last_updated_ts: ts.into(),
             anyone_link_sharing: None,
         },
-        model: CloudWorkflowModel::new(Workflow::new(format!("w{id}"), format!("c{id}"))),
-    };
+    );
 
     CloudModel::handle(app).update(app, |cloud_model, _| {
         cloud_model.add_object(sync_id, CloudWorkflow::new_from_server(workflow));

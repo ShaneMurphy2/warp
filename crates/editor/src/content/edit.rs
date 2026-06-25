@@ -15,14 +15,14 @@ use urlocator::{UrlLocation, UrlLocator};
 use vec1::Vec1;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::theme::Fill as ThemeFill;
-use warpui::assets::asset_cache::{AssetCache, AssetSource, AssetState};
-use warpui::fonts::Weight;
-use warpui::image_cache::ImageType;
-use warpui::text::char_slice;
-use warpui::text::point::Point;
-use warpui::text_layout::{StyleAndFont, TextAlignment};
-use warpui::units::{IntoPixels, Pixels};
-use warpui::{AppContext, SingletonEntity};
+use warpui_core::assets::asset_cache::{AssetCache, AssetSource, AssetState};
+use warpui_core::fonts::Weight;
+use warpui_core::image_cache::ImageType;
+use warpui_core::text::char_slice;
+use warpui_core::text::point::Point;
+use warpui_core::text_layout::{StyleAndFont, TextAlignment};
+use warpui_core::units::{IntoPixels, Pixels};
+use warpui_core::{AppContext, SingletonEntity};
 
 use super::buffer::{StyledBufferBlock, StyledBufferRun, StyledTextBlock};
 use super::mermaid_diagram::{mermaid_asset_source, mermaid_diagram_layout};
@@ -81,6 +81,7 @@ pub fn resolve_asset_source_relative_to_directory(
     } else if source.starts_with("/") {
         AssetSource::LocalFile {
             path: source.to_string(),
+            content_version: None,
         }
     } else {
         let resolved_path = if let Some(base_directory) = base_directory {
@@ -94,6 +95,7 @@ pub fn resolve_asset_source_relative_to_directory(
                 Ok(canon) => canon.to_string_lossy().to_string(),
                 Err(_) => resolved_path.to_string_lossy().to_string(),
             },
+            content_version: None,
         }
     }
 }
@@ -113,6 +115,7 @@ pub fn resolve_asset_source_relative_to_directory(
     } else {
         AssetSource::LocalFile {
             path: source.to_string(),
+            content_version: None,
         }
     }
 }

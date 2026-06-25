@@ -55,7 +55,7 @@ use crate::features::FeatureFlag;
 use crate::gpu_state::{GPUState, GPUStateEvent};
 use crate::prompt::editor_modal::OpenSource as PromptEditorOpenSource;
 use crate::server::telemetry::{InputUXChangeOrigin, TelemetryEvent};
-use crate::settings::app_icon::{AppIcon, AppIconSettings};
+use crate::settings::app_icon::{AppIcon, AppIconSettings, ShowDockIconState};
 use crate::settings::{
     active_theme_kind, respect_system_theme, AIFontName, AppEditorSettings, CursorBlink,
     CursorBlinkEnabled, CursorDisplayType, EnforceMinimumContrast, FocusPaneOnHover, FontSettings,
@@ -90,7 +90,8 @@ use crate::window_settings::{
 };
 use crate::workspace::header_toolbar_editor::HeaderToolbarInlineEditor;
 use crate::workspace::tab_settings::{
-    DirectoryTabColor, PreserveActiveTabColor, ShowCodeReviewButton, ShowIndicatorsButton,
+    canonical_directory_key, DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs,
+    PreserveActiveTabColor, ShowCodeReviewButton, ShowIndicatorsButton,
     ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition, TabSettings,
     TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames, UseVerticalTabs,
     WorkspaceDecorationVisibility,
@@ -249,6 +250,50 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         context.to_owned(),
     )
     .with_group(bindings::BindingGroup::Settings.as_str())]);
+    toggle_binding_pairs.push(ToggleSettingActionPair::new(
+        "open new windows with custom size",
+        builder(SettingsAction::AppearancePageToggle(
+            AppearancePageAction::ToggleOpenWindowsAtCustomSize,
+        )),
+        context,
+        flags::OPEN_WINDOWS_AT_CUSTOM_SIZE_FLAG,
+    ));
+
+    toggle_binding_pairs.push(ToggleSettingActionPair::new(
+        "window blur acrylic texture",
+        builder(SettingsAction::AppearancePageToggle(
+            AppearancePageAction::ToggleBlurTexture,
+        )),
+        context,
+        flags::WINDOW_BLUR_TEXTURE_FLAG,
+    ));
+
+    toggle_binding_pairs.push(ToggleSettingActionPair::new(
+        "tools panel visibility across tabs",
+        builder(SettingsAction::AppearancePageToggle(
+            AppearancePageAction::ToggleLeftPanelVisibility,
+        )),
+        context,
+        flags::LEFT_PANEL_VISIBILITY_ACROSS_TABS_FLAG,
+    ));
+
+    toggle_binding_pairs.push(ToggleSettingActionPair::new(
+        "agent font matching terminal font",
+        builder(SettingsAction::AppearancePageToggle(
+            AppearancePageAction::ToggleMatchAIToTerminalFontFamily,
+        )),
+        context,
+        flags::MATCH_AI_FONT_TO_TERMINAL_FONT_FLAG,
+    ));
+
+    toggle_binding_pairs.push(ToggleSettingActionPair::new(
+        "notebook font size matching terminal font size",
+        builder(SettingsAction::AppearancePageToggle(
+            AppearancePageAction::ToggleMatchNotebookToMonospaceFontSize,
+        )),
+        context,
+        flags::MATCH_NOTEBOOK_FONT_SIZE_TO_TERMINAL_FONT_SIZE_FLAG,
+    ));
 
     toggle_binding_pairs.push(
         ToggleSettingActionPair::new(
@@ -374,7 +419,15 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
                 AppearancePageAction::ToggleShowVerticalTabPanelInRestoredWindows,
             )),
             context,
-            flags::USE_VERTICAL_TABS_FLAG,
+            flags::SHOW_VERTICAL_TAB_PANEL_IN_RESTORED_WINDOWS_FLAG,
+        ));
+        toggle_binding_pairs.push(ToggleSettingActionPair::new(
+            "latest user prompt as conversation title in tab names",
+            builder(SettingsAction::AppearancePageToggle(
+                AppearancePageAction::ToggleUseLatestUserPromptAsConversationTitleInTabNames,
+            )),
+            context,
+            flags::USE_LATEST_USER_PROMPT_AS_CONVERSATION_TITLE_IN_TAB_NAMES_FLAG,
         ));
     }
 
@@ -388,6 +441,24 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             flags::LIGATURE_RENDERING_CONTEXT_FLAG,
         ));
     }
+
+    toggle_binding_pairs.push(ToggleSettingActionPair::new(
+        "preserve active tab color for new tabs",
+        builder(SettingsAction::AppearancePageToggle(
+            AppearancePageAction::TogglePreserveActiveTabColor,
+        )),
+        context,
+        flags::PRESERVE_ACTIVE_TAB_COLOR_FLAG,
+    ));
+
+    toggle_binding_pairs.push(ToggleSettingActionPair::new(
+        "custom padding in alt-screen",
+        builder(SettingsAction::AppearancePageToggle(
+            AppearancePageAction::ToggleAltScreenPadding,
+        )),
+        context,
+        flags::ALT_SCREEN_PADDING_FLAG,
+    ));
 
     ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(toggle_binding_pairs, app);
 }
@@ -430,6 +501,7 @@ pub enum AppearancePageAction {
     },
     SetInputType(InputBoxType),
     SetAppIcon(AppIcon),
+    ToggleShowDockIcon,
     SetCursorType(CursorDisplayType),
     SetWorkspaceDecorationVisibility(WorkspaceDecorationVisibility),
     ToggleWorkspaceDecorationVisibility,
@@ -448,6 +520,7 @@ pub enum AppearancePageAction {
     TogglePreserveActiveTabColor,
     ToggleVerticalTabs,
     ToggleShowVerticalTabPanelInRestoredWindows,
+    ToggleHideTitleBarSearchBarInVerticalTabs,
     ToggleUseLatestUserPromptAsConversationTitleInTabNames,
     ToggleLigatureRendering,
     ToggleBlurTexture,
@@ -456,6 +529,7 @@ pub enum AppearancePageAction {
     OpenUrl(String),
     ToggleFocusPaneOnHover,
     ToggleInputMode,
+    ToggleAltScreenPadding,
     UpdateAltScreenPaddingMode(AltScreenPaddingMode),
     SetTabCloseButtonPosition(TabCloseButtonPosition),
     SetZoomLevel(u16),
@@ -576,6 +650,7 @@ impl TypedActionView for AppearanceSettingsPageView {
             } => self.set_input_mode(*new_mode, *from_binding, ctx),
             SetInputType(input_type) => self.set_input_type(*input_type, ctx),
             SetAppIcon(new_icon) => self.set_app_icon(*new_icon, ctx),
+            ToggleShowDockIcon => self.toggle_show_dock_icon(ctx),
             SetCursorType(cursor_display_type) => self.set_cursor_type(*cursor_display_type, ctx),
             OpacitySliderDragged(val) => self.set_opacity(*val, false, ctx),
             BlurSliderDragged(val) => self.set_blur(*val, false, ctx),
@@ -588,6 +663,9 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleVerticalTabs => self.toggle_vertical_tabs(ctx),
             ToggleShowVerticalTabPanelInRestoredWindows => {
                 self.toggle_show_vertical_tab_panel_in_restored_windows(ctx)
+            }
+            ToggleHideTitleBarSearchBarInVerticalTabs => {
+                self.toggle_hide_title_bar_search_bar_in_vertical_tabs(ctx)
             }
             ToggleUseLatestUserPromptAsConversationTitleInTabNames => {
                 self.toggle_use_latest_user_prompt_as_conversation_title_in_tab_names(ctx)
@@ -614,6 +692,19 @@ impl TypedActionView for AppearanceSettingsPageView {
             }
             ToggleInputMode => {
                 self.toggle_input_mode(ctx);
+            }
+            ToggleAltScreenPadding => {
+                let new_mode = TerminalSettings::as_ref(ctx).alt_screen_padding.toggled();
+                TerminalSettings::handle(ctx).update(ctx, |terminal_settings, ctx| {
+                    report_if_error!(terminal_settings
+                        .alt_screen_padding
+                        .set_value(new_mode, ctx));
+                });
+                self.set_alt_screen_padding_editor_text(ctx);
+                send_telemetry_from_ctx!(
+                    TelemetryEvent::UpdateAltScreenPaddingMode { new_mode },
+                    ctx
+                );
             }
             UpdateAltScreenPaddingMode(new_mode) => {
                 TerminalSettings::handle(ctx).update(ctx, |terminal_settings, ctx| {
@@ -1378,6 +1469,9 @@ impl AppearanceSettingsPageView {
                 ShowVerticalTabPanelInRestoredWindowsWidget::default(),
             ));
             tab_settings_widgets.push(Box::new(
+                HideTitleBarSearchBarInVerticalTabsWidget::default(),
+            ));
+            tab_settings_widgets.push(Box::new(
                 UseLatestUserPromptAsConversationTitleInTabNamesWidget::default(),
             ));
             if FeatureFlag::ConfigurableToolbar.is_enabled() {
@@ -1442,6 +1536,11 @@ impl AppearanceSettingsPageView {
                 self.line_height_editor.update(ctx, move |editor, ctx| {
                     editor.set_buffer_text(&format!("{line_height_ratio}"), ctx);
                 });
+            }
+            AppearanceEvent::ThemeChanged => {
+                // Context-chip colors are theme-derived, so rebuild the Input
+                // preview chips when the theme changes to keep them in sync.
+                self.context_chips = Self::get_context_chip_renderers(ctx);
             }
             _ => {}
         }
@@ -2238,6 +2337,12 @@ impl AppearanceSettingsPageView {
         });
     }
 
+    fn toggle_show_dock_icon(&mut self, ctx: &mut ViewContext<Self>) {
+        AppIconSettings::handle(ctx).update(ctx, |app_icon_settings, ctx| {
+            report_if_error!(app_icon_settings.show_dock_icon.toggle_and_save_value(ctx));
+        });
+    }
+
     fn set_cursor_type(&mut self, new_cursor_type: CursorDisplayType, ctx: &mut ViewContext<Self>) {
         AppEditorSettings::handle(ctx).update(ctx, |app_editor_settings, ctx| {
             report_if_error!(app_editor_settings
@@ -2311,6 +2416,14 @@ impl AppearanceSettingsPageView {
         TabSettings::handle(ctx).update(ctx, |settings, ctx| {
             report_if_error!(settings
                 .show_vertical_tab_panel_in_restored_windows
+                .toggle_and_save_value(ctx));
+        });
+    }
+
+    fn toggle_hide_title_bar_search_bar_in_vertical_tabs(&mut self, ctx: &mut ViewContext<Self>) {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings
+                .hide_title_bar_search_bar_in_vertical_tabs
                 .toggle_and_save_value(ctx));
         });
     }
@@ -2793,34 +2906,31 @@ impl SettingsWidget for ThemeSelectWidget {
 }
 
 #[derive(Default)]
-struct CustomAppIconWidget {}
+struct CustomAppIconWidget {
+    show_dock_icon_switch_state: SwitchStateHandle,
+}
 
 impl SettingsWidget for CustomAppIconWidget {
     type View = AppearanceSettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "customize custom app icon icons"
+        "customize custom app icon icons dock cmd tab app switcher"
     }
 
     fn render(
         &self,
         view: &Self::View,
         appearance: &Appearance,
-        _app: &AppContext,
+        app: &AppContext,
     ) -> Box<dyn Element> {
         #[allow(unused_mut)]
         let show_bundle_warning = {
             #[cfg(target_os = "macos")]
-            #[allow(deprecated)]
             {
-                use cocoa::base::id;
-                use objc::{class, msg_send, sel, sel_impl};
-                unsafe {
-                    let running_app: id =
-                        msg_send![class!(NSRunningApplication), currentApplication];
-                    let bundle_id: id = msg_send![running_app, bundleIdentifier];
-                    bundle_id.is_null()
-                }
+                use objc2_app_kit::NSRunningApplication;
+                NSRunningApplication::currentApplication()
+                    .bundleIdentifier()
+                    .is_none()
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -2838,41 +2948,76 @@ impl SettingsWidget for CustomAppIconWidget {
             &view.app_icon_dropdown,
         );
 
+        let show_dock_icon_toggle = render_body_item::<AppearancePageAction>(
+            "Show Warp in Dock".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                ShowDockIconState::storage_key(),
+                ShowDockIconState::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.show_dock_icon_switch_state.clone())
+                .check(*AppIconSettings::as_ref(app).show_dock_icon)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(AppearancePageAction::ToggleShowDockIcon);
+                })
+                .finish(),
+            None,
+        );
+        let show_dock_icon_is_supported = AppIconSettings::as_ref(app)
+            .show_dock_icon
+            .is_supported_on_current_platform();
+
         #[cfg(target_os = "macos")]
         {
             use crate::appearance::AppearanceManager;
 
-            let app_icon_at_startup = AppearanceManager::as_ref(_app).app_icon_at_startup();
-            let current_icon = *AppIconSettings::as_ref(_app).app_icon;
+            let app_icon_at_startup = AppearanceManager::as_ref(app).app_icon_at_startup();
+            let current_icon = *AppIconSettings::as_ref(app).app_icon;
             if current_icon == AppIcon::Default
                 && ChannelState::channel() != Channel::Local
                 && app_icon_at_startup != AppIcon::Default
             {
                 let theme = appearance.theme();
-                return Flex::column()
-                    .with_child(dropdown)
-                    .with_child(
-                        appearance
-                            .ui_builder()
-                            .wrappable_text(
-                                "You may need to restart Warp for MacOS to apply the preferred icon style.",
-                                true,
-                            )
-                            .with_style(UiComponentStyles {
-                                font_color: Some(
-                                    theme.sub_text_color(theme.background()).into_solid(),
-                                ),
-                                margin: Some(Coords::default().bottom(8.)),
-                                ..Default::default()
-                            })
-                            .build()
-                            .finish(),
-                    )
-                    .finish();
+                let column = Flex::column().with_child(dropdown).with_child(
+                    appearance
+                        .ui_builder()
+                        .wrappable_text(
+                            "You may need to restart Warp for MacOS to apply the preferred icon style.",
+                            true,
+                        )
+                        .with_style(UiComponentStyles {
+                            font_color: Some(
+                                theme.sub_text_color(theme.background()).into_solid(),
+                            ),
+                            margin: Some(Coords::default().bottom(8.)),
+                            ..Default::default()
+                        })
+                        .build()
+                        .finish(),
+                );
+                let column = if show_dock_icon_is_supported {
+                    column.with_child(show_dock_icon_toggle)
+                } else {
+                    column
+                };
+                return column.finish();
             }
         }
 
-        dropdown
+        let column = Flex::column().with_child(dropdown);
+        let column = if show_dock_icon_is_supported {
+            column.with_child(show_dock_icon_toggle)
+        } else {
+            column
+        };
+        column.finish()
     }
 }
 
@@ -4646,6 +4791,56 @@ impl SettingsWidget for ShowVerticalTabPanelInRestoredWindowsWidget {
 }
 
 #[derive(Default)]
+struct HideTitleBarSearchBarInVerticalTabsWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for HideTitleBarSearchBarInVerticalTabsWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "hide title bar search bar vertical tabs chrome minimal"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tab_settings = TabSettings::as_ref(app);
+
+        render_body_item::<AppearancePageAction>(
+            "Hide search bar in vertical tab layout".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                HideTitleBarSearchBarInVerticalTabs::storage_key(),
+                HideTitleBarSearchBarInVerticalTabs::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*tab_settings.hide_title_bar_search_bar_in_vertical_tabs)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(
+                        AppearancePageAction::ToggleHideTitleBarSearchBarInVerticalTabs,
+                    );
+                })
+                .finish(),
+            Some(
+                "When using the vertical tab layout, hide the search bar in the title bar. Search stays available via the command palette and keyboard shortcuts."
+                    .to_string(),
+            ),
+        )
+    }
+}
+
+#[derive(Default)]
 struct UseLatestUserPromptAsConversationTitleInTabNamesWidget {
     switch_state: SwitchStateHandle,
 }
@@ -4760,8 +4955,7 @@ fn build_directory_delete_buttons(
 fn add_directory_tab_color_path(path: PathBuf, ctx: &mut ViewContext<AppearanceSettingsPageView>) {
     TabSettings::handle(ctx).update(ctx, |settings, ctx| {
         let current = settings.directory_tab_colors.value();
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-        let key = canonical.to_string_lossy().to_string();
+        let key = canonical_directory_key(&path);
         let dominated_by_existing = current
             .0
             .get(&key)
