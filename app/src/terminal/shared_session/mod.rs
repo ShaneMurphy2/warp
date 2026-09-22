@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use session_sharing_protocol::common::{Role, Scrollback, ScrollbackBlock, SessionId};
 use session_sharing_protocol::sharer::SessionSourceType;
 use warpui::keymap::ContextPredicate;
-use warpui::{id, AppContext};
+use warpui::{AppContext, WindowId, id};
 
 use super::model::block::SerializedBlock;
 use super::model::terminal_model::BlockIndex;
@@ -41,6 +41,46 @@ pub const COPY_LINK_TEXT: &str = "Sharing link copied";
 /// most up to date will always be sent after some delay)
 const SELECTION_THROTTLE_PERIOD: Duration = Duration::from_millis(20);
 
+/// `SessionSourceType` paired with the orchestrator `task_id` that rides
+/// on the `source_task_id` sidecar.
+#[derive(Debug, Clone)]
+pub struct SharedSessionSource {
+    pub source_type: SessionSourceType,
+    pub source_task_id: Option<String>,
+}
+
+impl SharedSessionSource {
+    pub fn user(source_task_id: Option<String>) -> Self {
+        Self {
+            source_type: SessionSourceType::User,
+            source_task_id,
+        }
+    }
+
+    pub fn ambient_agent(task_id: Option<String>) -> Self {
+        Self {
+            source_type: SessionSourceType::AmbientAgent {
+                task_id: task_id.clone(),
+            },
+            source_task_id: task_id,
+        }
+    }
+
+    /// Sidecar first, then `AmbientAgent.task_id` for legacy producers.
+    pub fn orchestrator_task_id(&self) -> Option<&str> {
+        self.source_task_id.as_deref().or(match &self.source_type {
+            SessionSourceType::AmbientAgent { task_id } => task_id.as_deref(),
+            SessionSourceType::User => None,
+        })
+    }
+}
+
+impl Default for SharedSessionSource {
+    fn default() -> Self {
+        Self::user(None)
+    }
+}
+
 /// Whether or not a local session is also being shared.
 /// Since a shared session creator is also the creator of a local session,
 /// we make use of the local_tty::TerminalManager for shared session creators.
@@ -48,9 +88,8 @@ const SELECTION_THROTTLE_PERIOD: Duration = Duration::from_millis(20);
 /// and a regular, purely local session.
 #[derive(Debug, Clone, Default)]
 pub enum IsSharedSessionCreator {
-    /// This session should be shared automatically once bootstrapped, using the
-    /// provided source type.
-    Yes { source_type: SessionSourceType },
+    /// This session should be shared automatically once bootstrapped.
+    Yes { source: SharedSessionSource },
     #[default]
     No,
 }
@@ -75,9 +114,9 @@ pub enum SharedSessionStatus {
     FinishedViewer,
 
     /// We haven't yet attempted to share the session because it is not bootstrapped yet.
-    /// The `source_type` encodes what kind of shared session will be created once the
-    /// session finishes bootstrapping.
-    SharePendingPreBootstrap { source_type: SessionSourceType },
+    /// The `source` encodes what kind of shared session will be created once
+    /// the session finishes bootstrapping.
+    SharePendingPreBootstrap { source: SharedSessionSource },
 
     /// The session is bootstrapped and we're in the process of
     /// sharing the session but have not yet established the
@@ -201,7 +240,7 @@ impl SharedSessionScrollbackType {
             .iter()
             .skip(first_block_index.into())
             .filter(|block| {
-                block.is_scrollback_block_for_shared_session(model.block_list().agent_view_state())
+                block.is_scrollback_block_for_shared_session(model.block_list().transcript_scope())
             })
             .filter_map(|block| {
                 let serialized_block: SerializedBlock = block.into();
@@ -229,7 +268,7 @@ impl SharedSessionScrollbackType {
                 .skip(block_index.into())
                 .find(|block| {
                     block.is_scrollback_block_for_shared_session(
-                        model.block_list().agent_view_state(),
+                        model.block_list().transcript_scope(),
                     )
                 })
                 .map_or(model.block_list().active_block_index(), |block| {
@@ -244,20 +283,19 @@ impl SharedSessionScrollbackType {
 }
 
 #[cfg(not(test))]
-pub fn max_session_size(ctx: &AppContext) -> Byte {
+pub fn max_session_size(window_id: WindowId, app: &AppContext) -> Byte {
     use warpui::SingletonEntity;
 
     use crate::workspaces::user_workspaces::UserWorkspaces;
-
-    UserWorkspaces::as_ref(ctx)
-        .current_team()
+    UserWorkspaces::as_ref(app)
+        .team_for_window(window_id)
         .and_then(|team| team.billing_metadata.tier.session_sharing_policy)
         .map(|policy| Byte::from_u64(policy.max_session_size))
         .unwrap_or(Byte::from_u64_with_unit(100, byte_unit::Unit::MB).unwrap())
 }
 
 #[cfg(test)]
-pub fn max_session_size(_ctx: &AppContext) -> Byte {
+pub fn max_session_size(_window_id: WindowId, _app: &AppContext) -> Byte {
     Byte::from_u64(MAX_BYTES_SHAREABLE as u64)
 }
 

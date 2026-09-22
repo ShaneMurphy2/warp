@@ -36,11 +36,11 @@ Record the range as `previous_cut_tag..release_tag`.
 
 ### Step 2 — Fetch PR data
 
-Run the `fetch_prs.py` script to collect all PRs merged in the release range and extract explicit changelog markers:
+Run the `fetch_prs.py` script to collect all public-release PRs merged in the release range and extract explicit changelog markers. Pass the repository that the workflow checked out, not necessarily the public repository. Release workflows run from `warpdotdev/warp-internal`, and the script deterministically resolves `warp-repo-sync[bot]` PRs back to their original public `warpdotdev/warp` PR metadata before emitting JSON. When running from `warpdotdev/warp-internal`, the script intentionally omits PRs that were not authored by the repo-sync bot, because those are private internal changes that must not be exposed to the changelog agent or generated artifacts.
 
 ```bash
 python3 .agents/skills/changelog-draft/scripts/fetch_prs.py \
-  --repo warpdotdev/warp \
+  --repo "${GITHUB_REPOSITORY:-warpdotdev/warp}" \
   --base-ref <previous_tag> \
   --head-ref <release_tag>
 ```
@@ -52,7 +52,9 @@ The script outputs JSON to stdout with this structure:
   "prs": [
     {
       "number": 1234,
+      "url": "https://github.com/warpdotdev/warp/pull/1234",
       "title": "...",
+      "commit_subject": "... (#1234)",
       "author": "username",
       "body": "...",
       "labels": ["..."],
@@ -61,11 +63,21 @@ The script outputs JSON to stdout with this structure:
         { "category": "NEW-FEATURE", "text": "Added dark mode" }
       ],
       "linked_issues": [5678],
-      "changed_files": ["app/src/ai/agent.rs", "crates/warp_features/src/lib.rs"]
+      "changed_files": ["app/src/ai/agent.rs", "crates/warp_features/src/lib.rs"],
+      "source_repo": "warpdotdev/warp",
+      "internal_pr": {
+        "number": 25712,
+        "url": "https://github.com/warpdotdev/warp-internal/pull/25712",
+        "author": "warp-repo-sync[bot]",
+        "title": "...",
+        "repo": "warpdotdev/warp-internal"
+      }
     }
   ]
 }
 ```
+
+Use the top-level `number`, `url`, `commit_subject`, `author`, `body`, `labels`, `changed_files`, and `source_repo` fields as the source of truth. `internal_pr` is audit-only and must never be used for contributor attribution or user-facing changelog links. If `url` is empty, omit the PR link from user-facing markdown rather than synthesizing one.
 
 ### Step 3 — Classify contributors
 
@@ -124,6 +136,7 @@ Output JSON (only external reporters are included):
       "issue_number": 5678,
       "title": "Crash when opening large file",
       "reporter": "community-user",
+      "reporter_url": "https://github.com/community-user",
       "url": "https://github.com/warpdotdev/warp/issues/5678"
     }
   ]
@@ -131,8 +144,10 @@ Output JSON (only external reporters are included):
 ```
 
 The `--org` flag checks each reporter's org membership via the GitHub API, filtering out internal members so they aren't misattributed as external community reporters. These reporters will be credited in the "Community" section of the changelog.
+Whenever the markdown draft credits a PR author, contributor, or issue reporter, render the username as a GitHub profile link such as `[@username](https://github.com/username)`.
 
 ### Step 6 — Classify unmarked PRs
+Determine TUI impact independently from the regular changelog category for every PR. Explicit `CHANGELOG-TUI` and `CHANGELOG-OZ` markers are authoritative entries and may coexist with New Feature, Improvement, or Bug Fix entries. When a PR has an explicit TUI entry, preserve its other explicit entries. Otherwise, if `commit_subject` contains `TUI` as a standalone case-insensitive token, route any explicit New Feature, Improvement, or Bug Fix text to `TUI` instead of its regular category. This keeps clearly TUI-labeled changes out of the desktop changelog while allowing explicitly marked shared changes to appear on both surfaces.
 
 For each PR that has no explicit `CHANGELOG-*` entries, decide whether to include it and under which category.
 
@@ -145,6 +160,7 @@ For each unmarked PR, produce a classification:
   "include": true,
   "category": "IMPROVEMENT",
   "text": "Proposed changelog line",
+  "impacts_tui": true,
   "confidence": "high",
   "rationale": "...",
   "feature_flag": null,
@@ -156,6 +172,7 @@ For each unmarked PR, produce a classification:
 - PRs that only touch CI, tests, docs, or internal tooling → `include: false`
 - PRs behind dogfood-only feature flags → `include: false` for stable channel
 - PRs behind preview flags → `include: false` for stable, `include: true` for preview
+- Set `impacts_tui: true` when Warp Agent CLI users observe the change, including shared Agent capabilities such as tool-call or edit-file behavior
 - When in doubt, set `needs_review: true` and `confidence: "low"`
 - Bot PRs (dependabot, renovate, etc.) → `include: false`
 
@@ -170,9 +187,14 @@ Combine explicit entries (Step 2) and inferred entries (Step 6) into the final r
 1. `NEW-FEATURE` — New Features
 2. `IMPROVEMENT` — Improvements
 3. `BUG-FIX` — Bug Fixes
-4. `OZ` — Oz Updates
+4. `TUI` — TUI Updates
+5. `OZ` — Oz Updates
 
 PRs marked with `CHANGELOG-NONE` are explicitly opted out and must never appear in the changelog markdown.
+
+Preserve every explicit entry independently. For an inferred regular entry with `impacts_tui: true`, also create a `TUI` entry with the same user-facing text and PR metadata. Do not duplicate an inferred entry whose category is already `TUI`.
+
+When creating entries, copy `pr_number`, `url`, `author`, `source_repo`, and `internal_pr` from the normalized PR record. The release JSON converter uses `url` directly; do not invent public PR URLs from PR numbers.
 
 ### Step 8 — Write output files
 
@@ -187,7 +209,7 @@ Write two files to `output_dir`:
 **Generated:** 2026-05-06T15:00:00Z
 
 ## New Features
-- Added dark mode ([#1234](https://github.com/warpdotdev/warp/pull/1234)) — @external-contributor ✨
+- Added dark mode ([#1234](https://github.com/warpdotdev/warp/pull/1234)) — [@external-contributor](https://github.com/external-contributor) ✨
 
 ## Improvements
 - Faster tab switching ([#1235](https://github.com/warpdotdev/warp/pull/1235))
@@ -195,16 +217,19 @@ Write two files to `output_dir`:
 ## Bug Fixes
 - Fixed crash on startup ([#1236](https://github.com/warpdotdev/warp/pull/1236))
 
+## TUI Updates
+- Added inline command menus to Warp Agent CLI ([#1238](https://github.com/warpdotdev/warp/pull/1238))
+
 ## Oz Updates
 - Improved agent memory ([#1237](https://github.com/warpdotdev/warp/pull/1237))
 
 ## Community
 ### Contributors
-- @contributor1 — [#1234](https://github.com/warpdotdev/warp/pull/1234)  ✨
+- [@contributor1](https://github.com/contributor1) — [#1234](https://github.com/warpdotdev/warp/pull/1234)  ✨
 
 ### Issue Reporters
 Thanks to the community members who reported issues fixed in this release:
-- @reporter1 — [#5678](https://github.com/warpdotdev/warp/issues/5678) "Crash when opening large file"
+- [@reporter1](https://github.com/reporter1) — [#5678](https://github.com/warpdotdev/warp/issues/5678) "Crash when opening large file"
 ```
 
 The markdown draft must **not** include "Needs Review" or "Skipped PRs" sections — those are internal details that belong only in the JSON audit artifact.
@@ -219,6 +244,7 @@ The markdown draft must **not** include "Needs Review" or "Skipped PRs" sections
   "entries": [
     {
       "pr_number": 1234,
+      "url": "https://github.com/warpdotdev/warp/pull/1234",
       "category": "NEW-FEATURE",
       "text": "Added dark mode",
       "source": "explicit",
@@ -226,7 +252,9 @@ The markdown draft must **not** include "Needs Review" or "Skipped PRs" sections
       "is_external": true,
       "confidence": "high",
       "rationale": null,
-      "feature_flag": null
+      "feature_flag": null,
+      "source_repo": "warpdotdev/warp",
+      "internal_pr": null
     }
   ],
   "skipped": [...],

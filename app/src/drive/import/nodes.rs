@@ -7,20 +7,20 @@ use anyhow::Result;
 use async_recursion::async_recursion;
 use futures_lite::StreamExt;
 use pathfinder_color::ColorU;
+use warp_errors::report_error;
+use warpui::Element;
 use warpui::elements::{
     Align, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Flex, Hoverable,
     MouseStateHandle, ParentElement, Radius, Shrinkable,
 };
 use warpui::platform::Cursor;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
-use warpui::Element;
 
-use super::modal_body::{ImportModalBodyAction, BASE_INDENT, IMPORT_FONT_SIZE, INDENT_MARGIN};
+use super::modal_body::{BASE_INDENT, IMPORT_FONT_SIZE, INDENT_MARGIN, ImportModalBodyAction};
 use crate::appearance::Appearance;
-use crate::drive::cloud_object_styling::warp_drive_icon_color;
 use crate::drive::DriveObjectType;
+use crate::drive::cloud_object_styling::warp_drive_icon_color;
 use crate::notebooks::file::is_markdown_file;
-use crate::notebooks::post_process_notebook;
 use crate::server::ids::ClientId;
 use crate::themes::theme::Fill;
 use crate::ui_components::icons::Icon;
@@ -721,7 +721,7 @@ impl FileUploadState {
         match self.folder_id_to_node.get(&folder_id) {
             Some(folder_node) => Some(folder_node.cloud_id()),
             None => {
-                log::error!("Provided folder id should exist");
+                report_error!("Provided folder id should exist");
                 None
             }
         }
@@ -893,9 +893,7 @@ impl FileUploadState {
 
 pub(super) async fn parse_file(path: PathBuf, file_type: FileType) -> Result<FileContent> {
     match file_type {
-        FileType::Notebook => Ok(FileContent::Notebook(post_process_notebook(
-            &async_fs::read_to_string(path).await?,
-        ))),
+        FileType::Notebook => Ok(FileContent::Notebook(async_fs::read_to_string(path).await?)),
         FileType::Workflow => {
             let file = async_fs::read(path).await?;
             let mut workflow_enums: HashMap<ClientId, WorkflowEnum> = HashMap::new();

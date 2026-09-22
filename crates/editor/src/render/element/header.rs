@@ -27,11 +27,15 @@ impl RenderableBlock for RenderableHeader {
     fn layout(
         &mut self,
         model: &RenderState,
-        ctx: &mut warpui::LayoutContext,
-        app: &warpui::AppContext,
+        ctx: &mut warpui_core::LayoutContext,
+        app: &warpui_core::AppContext,
     ) {
-        self.placeholder
-            .layout(&self.viewport_item, model, ctx, app, |block| {
+        self.placeholder.layout(
+            &self.viewport_item,
+            model,
+            ctx.text_layout_cache,
+            app,
+            |block| {
                 let header_size = match block {
                     BlockItem::Header { header_size, .. } => *header_size,
                     other => {
@@ -46,10 +50,16 @@ impl RenderableBlock for RenderableHeader {
                     text: header_size.label(),
                     block_style: BufferBlockStyle::Header { header_size },
                 }
-            });
+            },
+        );
     }
 
-    fn paint(&mut self, model: &RenderState, ctx: &mut RenderContext, _app: &warpui::AppContext) {
+    fn paint(
+        &mut self,
+        model: &RenderState,
+        ctx: &mut RenderContext,
+        _app: &warpui_core::AppContext,
+    ) {
         let content = model.content();
         let (paragraph, header_size) = extract_block!(
             self.viewport_item, content,

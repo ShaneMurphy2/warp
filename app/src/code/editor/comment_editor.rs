@@ -166,7 +166,10 @@ impl CommentEditor {
         let save_button = ctx.add_typed_action_view(|ctx| {
             ActionButton::new("Comment", PrimaryTheme)
                 .with_keybinding(
-                    KeystrokeSource::Fixed(Keystroke::parse("cmdorctrl-enter").unwrap_or_default()),
+                    KeystrokeSource::Fixed(
+                        Keystroke::parse(crate::code_review::CODE_REVIEW_SUBMIT_KEYSTROKE)
+                            .unwrap_or_default(),
+                    ),
                     ctx,
                 )
                 .on_click(|ctx| {
@@ -424,8 +427,8 @@ impl View for CommentEditor {
                     )
                     .with_child(
                         Container::new(footer_row)
-                            .with_vertical_padding(8.)
-                            .with_horizontal_padding(8.)
+                            .with_vertical_padding(4.)
+                            .with_horizontal_padding(4.)
                             .with_border(Border::top(1.).with_border_fill(border_color))
                             .finish(),
                     )

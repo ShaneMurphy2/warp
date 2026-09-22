@@ -22,30 +22,42 @@
 //! framework's render path (which needs `Appearance` / theme singletons
 //! that aren't relevant to the handler's correctness).
 
+use std::collections::HashMap;
+
 use warp_core::ui::appearance::Appearance;
-use warpui::platform::WindowStyle;
 use warpui::App;
+use warpui::platform::WindowStyle;
 
 use super::*;
+use crate::persistence::model::{ModelTokenUsage, PRIMARY_AGENT_CATEGORY};
+use crate::test_util::settings::initialize_settings_for_tests;
 
 fn placeholder_usage_info() -> ConversationUsageInfo {
     ConversationUsageInfo {
         credits_spent: 0.0,
+        platform_credits_spent: 0.0,
         credits_spent_for_last_block: None,
         tool_calls: 0,
         models: Vec::new(),
         context_window_usage: 0.0,
+        context_window_segments: Vec::new(),
         files_changed: 0,
         lines_added: 0,
         lines_removed: 0,
         commands_executed: 0,
+        total_tokens: None,
+        total_cost_in_cents: None,
+        tokens_for_last_block: None,
+        cost_in_cents_for_last_block: None,
     }
 }
 
 /// Registers the singletons that the view touches when constructed and
-/// when `ctx.notify()` runs (theme lookups, etc.). Keep this minimal: the
-/// goal is to satisfy the runtime, not to mirror the full production app.
+/// when `ctx.notify()` runs (theme lookups, settings, etc.). Keep this
+/// minimal: the goal is to satisfy the runtime, not to mirror the full
+/// production app.
 fn initialize_test_app(app: &mut App) {
+    initialize_settings_for_tests(app);
     app.add_singleton_model(|_| Appearance::mock());
 }
 
@@ -118,6 +130,33 @@ fn toggle_details_expanded_flips_state_and_resets_show_all_on_collapse() {
             );
         });
     });
+}
+
+#[test]
+fn custom_endpoint_models_use_the_external_key_icon_bucket() {
+    let view = ConversationUsageView::new(
+        ConversationUsageInfo {
+            models: vec![ModelTokenUsage {
+                model_id: "Friendly alias".to_string(),
+                custom_endpoint_tokens: 6,
+                custom_endpoint_token_usage_by_category: HashMap::from([(
+                    PRIMARY_AGENT_CATEGORY.to_string(),
+                    6,
+                )]),
+                ..Default::default()
+            }],
+            ..placeholder_usage_info()
+        },
+        DisplayMode::Footer,
+        None,
+        MouseStateHandle::default(),
+    );
+
+    assert_eq!(
+        view.collect_models_by_category()
+            .get(PRIMARY_AGENT_CATEGORY),
+        Some(&vec![("Friendly alias".to_string(), true)])
+    );
 }
 
 #[test]

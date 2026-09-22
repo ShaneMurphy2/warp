@@ -4,7 +4,7 @@ use markdown_parser::{compute_formatted_text_delta, parse_markdown};
 use serde_yaml::Value;
 use string_offset::CharOffset;
 use vec1::Vec1;
-use warpui::{App, ReadModel};
+use warpui_core::{App, ReadModel};
 
 use super::MarkdownStyle;
 use crate::content::buffer::tests::TestEmbeddedItem;
@@ -257,6 +257,36 @@ fn test_apply_formatted_text_delta_append() {
         // We add a trailing newline
         assert_eq!(exported.trim_end(), new_markdown_2);
         assert_eq!(new_formatted_2, formatted_in_buffer);
+    });
+}
+
+#[test]
+fn test_apply_formatted_text_delta_replaces_content_with_empty_document() {
+    App::test((), |mut app| async move {
+        let old_markdown = "hello world\n";
+        let (buffer, selection) = Buffer::mock_from_markdown(
+            old_markdown,
+            None,
+            Box::new(|_, _| IndentBehavior::Ignore),
+            &mut app,
+        );
+
+        let old_formatted = app.read_model(&buffer, |buffer, _| {
+            buffer.range_to_formatted_text(
+                CharOffset::from(1)..buffer.max_charoffset(),
+                StyledBlockBoundaryBehavior::Inclusive,
+            )
+        });
+        let delta = compute_formatted_text_delta(old_formatted, parse_markdown("").unwrap());
+
+        buffer.update(&mut app, |buffer, ctx| {
+            buffer.apply_formatted_text_delta(&delta, selection, ctx);
+        });
+
+        assert_eq!(
+            app.read_model(&buffer, |buffer, _| buffer.markdown_unescaped()),
+            ""
+        );
     });
 }
 

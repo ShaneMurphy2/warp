@@ -1,6 +1,6 @@
-use warpui::elements::{Border, CornerRadius, ListIndentLevel, Radius, Rect};
-use warpui::geometry::vector::vec2f;
-use warpui::{Element, SizeConstraint};
+use warpui_core::elements::{Border, CornerRadius, ListIndentLevel, Radius, Rect};
+use warpui_core::geometry::vector::vec2f;
+use warpui_core::{Element, SizeConstraint};
 
 use super::RenderableBlock;
 use super::paint::RenderContext;
@@ -61,16 +61,20 @@ impl RenderableBlock for RenderableBulletList {
     fn layout(
         &mut self,
         model: &RenderState,
-        ctx: &mut warpui::LayoutContext,
-        app: &warpui::AppContext,
+        ctx: &mut warpui_core::LayoutContext,
+        app: &warpui_core::AppContext,
     ) {
         self.bullet_point.layout(
             SizeConstraint::strict(vec2f(self.bullet_size, self.bullet_size)),
             ctx,
             app,
         );
-        self.placeholder
-            .layout(&self.viewport_item, model, ctx, app, |block| {
+        self.placeholder.layout(
+            &self.viewport_item,
+            model,
+            ctx.text_layout_cache,
+            app,
+            |block| {
                 let indent_level = match block {
                     BlockItem::UnorderedList { indent_level, .. } => *indent_level,
                     _ => ListIndentLevel::One,
@@ -79,10 +83,16 @@ impl RenderableBlock for RenderableBulletList {
                     text: "List",
                     block_style: BufferBlockStyle::UnorderedList { indent_level },
                 }
-            })
+            },
+        )
     }
 
-    fn paint(&mut self, model: &RenderState, ctx: &mut RenderContext, app: &warpui::AppContext) {
+    fn paint(
+        &mut self,
+        model: &RenderState,
+        ctx: &mut RenderContext,
+        app: &warpui_core::AppContext,
+    ) {
         let content = model.content();
         let unordered_list = extract_block!(self.viewport_item, content, (block, BlockItem::UnorderedList{ paragraph: inner, ..}) => block.unordered_list(inner));
 

@@ -10,13 +10,13 @@ use ui_components::{Component as _, Options, button, dialog, switch, tooltip};
 use warp_core::ui::Icon;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::color::internal_colors;
-use warpui::assets::asset_cache::{AssetCache, AssetSource, AssetState};
-use warpui::r#async::Timer;
-use warpui::elements::Stack;
-use warpui::image_cache::ImageType;
-use warpui::keymap::FixedBinding;
-use warpui::prelude::*;
-use warpui::{AssetProvider, SingletonEntity, Tracked, platform};
+use warpui_core::assets::asset_cache::{AssetCache, AssetSource, AssetState};
+use warpui_core::r#async::Timer;
+use warpui_core::elements::Stack;
+use warpui_core::image_cache::ImageType;
+use warpui_core::keymap::FixedBinding;
+use warpui_core::prelude::*;
+use warpui_core::{AssetProvider, SingletonEntity, Tracked, platform};
 
 #[derive(Clone, Copy, RustEmbed)]
 #[folder = "../../app/assets"]
@@ -35,14 +35,17 @@ impl AssetProvider for Assets {
     }
 }
 
-fn main() -> warpui::platform::app::TerminationResult {
+fn main() -> warpui_core::platform::app::TerminationResult {
     // Initialize the TLS provider so reqwest can make HTTPS requests.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("must be able to initialize crypto provider for TLS support");
 
-    let app_builder =
-        platform::AppBuilder::new(platform::AppCallbacks::default(), Box::new(ASSETS), None);
+    let app_builder = warpui::platform::AppBuilder::new(
+        platform::AppCallbacks::default(),
+        Box::new(ASSETS),
+        None,
+    );
     app_builder.run(move |ctx| {
         let font_name = if cfg!(target_os = "macos") {
             ".AppleSystemUIFont".to_string()
@@ -52,7 +55,7 @@ fn main() -> warpui::platform::app::TerminationResult {
             "Noto Sans".to_string()
         };
 
-        let font_family = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _ctx| {
+        let font_family = warpui_core::fonts::Cache::handle(ctx).update(ctx, |cache, _ctx| {
             cache.load_system_font(&font_name).unwrap()
         });
         ctx.add_singleton_model(|ctx| {
@@ -62,7 +65,7 @@ fn main() -> warpui::platform::app::TerminationResult {
         });
 
         {
-            use warpui::keymap::macros::*;
+            use warpui_core::keymap::macros::*;
             let lightbox_open = id!("RootView") & id!("RootView_LightboxOpen");
             ctx.register_fixed_bindings([
                 FixedBinding::new(
@@ -80,7 +83,7 @@ fn main() -> warpui::platform::app::TerminationResult {
             ]);
         }
 
-        ctx.add_window(warpui::AddWindowOptions::default(), RootView::new);
+        ctx.add_window(warpui_core::AddWindowOptions::default(), RootView::new);
     })
 }
 
@@ -172,7 +175,7 @@ impl View for RootView {
         "RootView"
     }
 
-    fn keymap_context(&self, _: &AppContext) -> warpui::keymap::Context {
+    fn keymap_context(&self, _: &AppContext) -> warpui_core::keymap::Context {
         let mut context = Self::default_keymap_context();
         if *self.dialog_open {
             context.set.insert("RootView_DialogOpen");
@@ -238,7 +241,7 @@ impl RootView {
                 options: switch::Options {
                     hover_border_size: Some(10.),
                     label: Some(Box::new(move |appearance: &Appearance| {
-                        warpui::elements::Text::new(
+                        warpui_core::elements::Text::new(
                             "Switch",
                             appearance.ui_font_family(),
                             appearance.ui_font_size(),
@@ -258,7 +261,7 @@ impl RootView {
             tooltip::Params {
                 label: "Tooltip label".into(),
                 options: tooltip::Options {
-                    keyboard_shortcut: Some(warpui::keymap::Keystroke {
+                    keyboard_shortcut: Some(warpui_core::keymap::Keystroke {
                         ctrl: true,
                         key: "k".to_string(),
                         ..Default::default()
@@ -280,7 +283,7 @@ impl RootView {
                         content: button::Content::Label("Primary".into()),
                         theme: &button::themes::Primary,
                         options: button::Options {
-                            keystroke: Some(warpui::keymap::Keystroke {
+                            keystroke: Some(warpui_core::keymap::Keystroke {
                                 ctrl: true,
                                 key: "k".to_string(),
                                 ..Default::default()
@@ -302,7 +305,7 @@ impl RootView {
                         content: button::Content::Label("Secondary".into()),
                         theme: &button::themes::Secondary,
                         options: button::Options {
-                            keystroke: Some(warpui::keymap::Keystroke {
+                            keystroke: Some(warpui_core::keymap::Keystroke {
                                 cmd: true,
                                 key: "enter".to_string(),
                                 ..Default::default()
@@ -325,7 +328,7 @@ impl RootView {
                         theme: &button::themes::Primary,
                         options: button::Options {
                             disabled: true,
-                            keystroke: Some(warpui::keymap::Keystroke {
+                            keystroke: Some(warpui_core::keymap::Keystroke {
                                 shift: true,
                                 key: "d".to_string(),
                                 ..Default::default()
@@ -366,7 +369,7 @@ impl RootView {
                         theme: &button::themes::Primary,
                         options: button::Options {
                             size: button::Size::Small,
-                            keystroke: Some(warpui::keymap::Keystroke {
+                            keystroke: Some(warpui_core::keymap::Keystroke {
                                 ctrl: true,
                                 key: "k".to_string(),
                                 ..Default::default()
@@ -389,7 +392,7 @@ impl RootView {
                         theme: &button::themes::Secondary,
                         options: button::Options {
                             size: button::Size::Small,
-                            keystroke: Some(warpui::keymap::Keystroke {
+                            keystroke: Some(warpui_core::keymap::Keystroke {
                                 cmd: true,
                                 key: "enter".to_string(),
                                 ..Default::default()
@@ -413,7 +416,7 @@ impl RootView {
                         options: button::Options {
                             disabled: true,
                             size: button::Size::Small,
-                            keystroke: Some(warpui::keymap::Keystroke {
+                            keystroke: Some(warpui_core::keymap::Keystroke {
                                 shift: true,
                                 key: "d".to_string(),
                                 ..Default::default()
@@ -436,7 +439,7 @@ impl RootView {
                         theme: &button::themes::Secondary,
                         options: button::Options {
                             size: button::Size::Small,
-                            keystroke: Some(warpui::keymap::Keystroke {
+                            keystroke: Some(warpui_core::keymap::Keystroke {
                                 key: "escape".to_string(),
                                 ..Default::default()
                             }),
@@ -496,7 +499,7 @@ impl RootView {
                     on_dismiss: Some(Arc::new(|ctx, _app| {
                         ctx.dispatch_typed_action(Action::CloseDialog);
                     })),
-                    dismiss_keystroke: Some(warpui::keymap::Keystroke {
+                    dismiss_keystroke: Some(warpui_core::keymap::Keystroke {
                         key: "escape".to_string(),
                         ..Default::default()
                     }),
@@ -547,10 +550,11 @@ impl RootView {
     }
 
     fn render_lightbox(&self, appearance: &Appearance, app: &AppContext) -> Box<dyn Element> {
-        let current_image_native_size = self
+        let current_image_state = self
             .lightbox_images
             .get(self.lightbox_current_index)
-            .and_then(|img| native_size_for_image(img, app));
+            .map(|img| image_state_for_image(img, app))
+            .unwrap_or(lightbox::CurrentImageState::Loading);
 
         self.lightbox.render(
             appearance,
@@ -560,9 +564,9 @@ impl RootView {
                 on_dismiss: Arc::new(|ctx, _app| {
                     ctx.dispatch_typed_action(Action::CloseLightbox);
                 }),
-                current_image_native_size,
+                current_image_state,
                 options: lightbox::Options {
-                    dismiss_keystroke: Some(warpui::keymap::Keystroke {
+                    dismiss_keystroke: Some(warpui_core::keymap::Keystroke {
                         key: "escape".to_string(),
                         ..Default::default()
                     }),
@@ -580,10 +584,11 @@ impl RootView {
     }
 
     fn render_async_lightbox(&self, appearance: &Appearance, app: &AppContext) -> Box<dyn Element> {
-        let current_image_native_size = self
+        let current_image_state = self
             .async_lightbox_images
             .get(self.async_lightbox_current_index)
-            .and_then(|img| native_size_for_image(img, app));
+            .map(|img| image_state_for_image(img, app))
+            .unwrap_or(lightbox::CurrentImageState::Loading);
 
         self.async_lightbox.render(
             appearance,
@@ -593,9 +598,9 @@ impl RootView {
                 on_dismiss: Arc::new(|ctx, _app| {
                     ctx.dispatch_typed_action(Action::CloseLightbox);
                 }),
-                current_image_native_size,
+                current_image_state,
                 options: lightbox::Options {
-                    dismiss_keystroke: Some(warpui::keymap::Keystroke {
+                    dismiss_keystroke: Some(warpui_core::keymap::Keystroke {
                         key: "escape".to_string(),
                         ..Default::default()
                     }),
@@ -721,20 +726,25 @@ struct ButtonRow {
     icon: button::Button,
 }
 
-/// Queries the `AssetCache` for the native pixel dimensions of a lightbox image.
-/// Returns `Some` when the image bytes have been fully loaded and decoded.
-fn native_size_for_image(image: &LightboxImage, app: &AppContext) -> Option<Vector2F> {
+/// Queries the `AssetCache` for the load state of a lightbox image's bytes.
+fn image_state_for_image(image: &LightboxImage, app: &AppContext) -> lightbox::CurrentImageState {
     match &image.source {
         LightboxImageSource::Resolved { asset_source } => {
             let asset_cache = AssetCache::as_ref(app);
             match asset_cache.load_asset::<ImageType>(asset_source.clone()) {
                 AssetState::Loaded { data } => data
                     .image_size()
-                    .map(|size| Vector2F::new(size.x() as f32, size.y() as f32)),
-                _ => None,
+                    .map(|size| lightbox::CurrentImageState::Loaded {
+                        native_size: Vector2F::new(size.x() as f32, size.y() as f32),
+                    })
+                    .unwrap_or(lightbox::CurrentImageState::Failed),
+                AssetState::FailedToLoad(_) => lightbox::CurrentImageState::Failed,
+                AssetState::Loading { .. } | AssetState::Evicted => {
+                    lightbox::CurrentImageState::Loading
+                }
             }
         }
-        LightboxImageSource::Loading => None,
+        LightboxImageSource::Loading => lightbox::CurrentImageState::Loading,
     }
 }
 

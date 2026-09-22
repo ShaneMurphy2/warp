@@ -18,17 +18,17 @@ use warpui::r#async::SpawnedFutureHandle;
 use warpui::{EntityId, ModelContext};
 use work_queue::FindWorkQueue;
 
-use super::rich_content::{FindableRichContentHandle, RichContentMatchId};
 use super::FindOptions;
+use super::rich_content::{FindableRichContentHandle, RichContentMatchId};
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::find::model::TerminalFindModel;
+use crate::terminal::model::TerminalModel;
 use crate::terminal::model::blocks::{
     BlockHeight, BlockHeightItem, BlockHeightSummary, BlockList, TotalIndex,
 };
 use crate::terminal::model::grid::grid_handler::{AbsolutePoint, GridHandler};
 use crate::terminal::model::index::Point;
 use crate::terminal::model::terminal_model::{BlockIndex, BlockSortDirection};
-use crate::terminal::model::TerminalModel;
 use crate::throttle::throttle;
 use crate::view_components::find::{FindDirection, FindEvent};
 
@@ -132,23 +132,88 @@ pub struct AbsoluteMatch {
     pub start: AbsolutePoint,
     /// End point with absolute row index.
     pub end: AbsolutePoint,
+    /// `true` if this match lies in an output row hidden by an active block
+    /// filter. Only ever set for Output-grid matches; command/AI matches are
+    /// never filtered. Mirrors `BlockGridMatch::is_filtered` on the sync path.
+    /// Filtered matches are treated as if they don't exist for search (excluded
+    /// from the count, focus traversal, and highlight rendering).
+    pub is_filtered: bool,
 }
 
 impl AbsoluteMatch {
-    /// Creates an AbsoluteMatch from a relative Point range.
+    /// Creates an AbsoluteMatch from a range whose points are in the grid's
+    /// **original** (unfiltered) coordinate space — i.e. the coordinates the
+    /// background scan produces by iterating the full grid. The absolute row is
+    /// the original row offset by the number of truncated scrollback lines.
+    ///
+    /// This intentionally does NOT apply the displayed↔original translation that
+    /// `AbsolutePoint::from_point` performs: the scan always yields original
+    /// coordinates, and translating here would corrupt match rows when a block
+    /// filter is active during the scan (mapping distinct original rows onto the
+    /// same displayed row).
     pub fn from_range(range: &RangeInclusive<Point>, grid: &GridHandler) -> Self {
+        let num_lines_truncated = grid.num_lines_truncated();
         Self {
-            start: AbsolutePoint::from_point(*range.start(), grid),
-            end: AbsolutePoint::from_point(*range.end(), grid),
+            start: AbsolutePoint {
+                row: range.start().row as u64 + num_lines_truncated,
+                col: range.start().col,
+            },
+            end: AbsolutePoint {
+                row: range.end().row as u64 + num_lines_truncated,
+                col: range.end().col,
+            },
+            is_filtered: false,
         }
     }
 
     /// Converts back to a relative Point range.
     ///
     /// Returns `None` if either point has been truncated from scrollback.
+    ///
+    /// NOTE: `AbsolutePoint::to_point` applies a displayed↔original filter
+    /// translation when a block filter is active. For rendering find highlights
+    /// use [`to_original_range`](Self::to_original_range) instead — the grid
+    /// renderer expects original coordinates and performs the displayed mapping
+    /// itself (see that method's docs).
     pub fn to_range(&self, grid: &GridHandler) -> Option<RangeInclusive<Point>> {
         let start = self.start.to_point(grid)?;
         let end = self.end.to_point(grid)?;
+        Some(start..=end)
+    }
+
+    /// Converts back to a relative Point range in the grid's **original**
+    /// (unfiltered) coordinate space: it only undoes scrollback truncation and
+    /// does NOT apply the displayed↔original filter translation that
+    /// [`to_range`](Self::to_range) performs.
+    ///
+    /// This is the coordinate space the grid renderer expects for find
+    /// highlights — it maps original rows to on-screen (displayed) positions
+    /// itself, exactly as it does for the synchronous find path, whose match
+    /// ranges are stored in original coordinates. Passing already-displayed
+    /// coordinates would be double-translated by the renderer and land on the
+    /// wrong rows (or off-screen) when a block filter is active.
+    ///
+    /// Returns `None` if either point has been truncated from scrollback.
+    pub fn to_original_range(&self, grid: &GridHandler) -> Option<RangeInclusive<Point>> {
+        let num_lines_truncated = grid.num_lines_truncated();
+        let start = Point {
+            row: self
+                .start
+                .row
+                .checked_sub(num_lines_truncated)?
+                .try_into()
+                .ok()?,
+            col: self.start.col,
+        };
+        let end = Point {
+            row: self
+                .end
+                .row
+                .checked_sub(num_lines_truncated)?
+                .try_into()
+                .ok()?,
+            col: self.end.col,
+        };
         Some(start..=end)
     }
 
@@ -202,6 +267,42 @@ pub struct AsyncBlockGridMatch {
     pub block_index: BlockIndex,
 }
 
+/// A focused match in a rich content (AI) block.
+///
+/// Mirrors the data carried by `BlockListMatch::RichContent` in the sync path,
+/// so callers can synthesize a `BlockListMatch` from either path.
+///
+/// This is a snapshot of the controller's state at the time it was produced.
+/// `match_id` is the most volatile field: `AIBlock::run_find` regenerates all
+/// match ids from a process-global atomic counter on every rescan (see
+/// `app/src/ai/blocklist/block/find.rs`), so any cached id is invalidated the
+/// next time that AI block is scanned. `total_index` is more stable — it only
+/// shifts when the blocklist sumtree itself is mutated at a non-end position
+/// (banner/gap insertion, scrollback truncation), not when new output streams
+/// into an existing AI block. Callers should still consume the value inline
+/// and not hold it across `process_message` deliveries.
+///
+/// TODO(vkodithala): This mirrors `BlockListMatch::RichContent` in the sync path. Both
+/// derive `Clone` even though their contents are short-lived; explore removing
+/// `Clone` from both in a future PR to enforce the snapshot contract in the
+/// type system.
+#[derive(Debug, Clone)]
+pub struct AsyncFocusedAiMatch {
+    /// The view id of the rich content block.
+    pub view_id: EntityId,
+    /// The id of the focused match within the rich content block.
+    pub match_id: RichContentMatchId,
+    /// The total index of the rich content block in the blocklist sumtree.
+    pub total_index: TotalIndex,
+}
+
+/// Resolution of the global focused match index to either a terminal or an AI match.
+#[derive(Debug, Clone)]
+enum FocusedMatchResolution {
+    Terminal(AsyncBlockGridMatch),
+    Ai(AsyncFocusedAiMatch),
+}
+
 /// Per-block find results, keyed by block index.
 #[derive(Debug, Default)]
 pub(crate) struct BlockFindResults {
@@ -217,9 +318,18 @@ pub(crate) struct BlockFindResults {
 }
 
 impl BlockFindResults {
-    /// Returns the total number of matches across all blocks.
+    /// Returns the total number of *visible* matches across all blocks.
+    ///
+    /// Output matches hidden by an active block filter (`is_filtered`) are
+    /// excluded so the count matches the sync path, where filtered rows are
+    /// treated as if they don't exist for search. Command and AI matches are
+    /// never filtered.
     fn total_match_count(&self) -> usize {
-        let terminal_count: usize = self.terminal_matches.values().map(|v| v.len()).sum();
+        let terminal_count: usize = self
+            .terminal_matches
+            .values()
+            .map(|v| v.iter().filter(|m| !m.is_filtered).count())
+            .sum();
         let ai_count: usize = self.ai_matches.values().map(|v| v.len()).sum();
         terminal_count + ai_count
     }
@@ -371,9 +481,10 @@ pub struct AsyncFindController {
     /// The FindOptions for the current find run, stored for `active_find_options()` access.
     current_find_options: Option<FindOptions>,
 
-    /// Cached result of `focused_terminal_match()`, updated when focus or matches change.
-    /// Avoids re-sorting HashMap keys and iterating on every call.
-    cached_focused_match: Option<AsyncBlockGridMatch>,
+    /// Cached resolution of `focused_match_index` to either a terminal match,
+    /// an AI match, or `None` (out of range). Updated when focus or matches
+    /// change
+    cached_focused_match: Option<FocusedMatchResolution>,
 
     /// Monotonically increasing generation counter, bumped each time new streams
     /// are spawned. The result stream callback captures the generation at spawn
@@ -482,27 +593,42 @@ impl AsyncFindController {
         self.update_cached_focused_match();
     }
 
-    /// Returns the focused match as an AsyncBlockGridMatch if it's a terminal match.
+    /// Returns the focused match as an [`AsyncBlockGridMatch`] if it's a terminal match.
     ///
     /// Returns a cached value that is updated when focus or matches change,
-    /// avoiding the cost of sorting and iterating on every call.
+    /// avoiding the cost of sorting and iterating on every call. Returns
+    /// `None` if focus is on an AI match or out of range.
     pub fn focused_terminal_match(&self) -> Option<AsyncBlockGridMatch> {
-        self.cached_focused_match.clone()
+        match &self.cached_focused_match {
+            Some(FocusedMatchResolution::Terminal(m)) => Some(m.clone()),
+            _ => None,
+        }
     }
 
-    /// Recomputes the cached focused match from the current matches and focus index.
-    fn update_cached_focused_match(&mut self) {
-        self.cached_focused_match = self.compute_focused_terminal_match();
+    /// Returns the focused match as an `AsyncFocusedAiMatch` if it's an AI match.
+    ///
+    /// Returns a cached value that is updated when focus or matches change,
+    /// avoiding the cost of sorting and iterating on every call. Returns
+    /// `None` if focus is on a terminal match or out of range.
+    pub fn focused_ai_match(&self) -> Option<AsyncFocusedAiMatch> {
+        match &self.cached_focused_match {
+            Some(FocusedMatchResolution::Ai(m)) => Some(m.clone()),
+            _ => None,
+        }
     }
 
-    /// Computes the focused terminal match by iterating through all matches
+    /// Recomputes the cached focused match by iterating through all matches
     /// (terminal and AI) in visual display order, derived from the TotalIndex
     /// maps stored in the block results.
     ///
-    /// Returns `Some` if the focused index lands on a terminal match, `None`
-    /// if it lands on an AI match or is out of range.
-    fn compute_focused_terminal_match(&self) -> Option<AsyncBlockGridMatch> {
-        let focused_idx = self.focused_match_index?;
+    /// Resolves the global `focused_match_index` to either a terminal match or
+    /// an AI match (or `None`, if out of range) and stores it in the unified
+    /// cache.
+    fn update_cached_focused_match(&mut self) {
+        let Some(focused_idx) = self.focused_match_index else {
+            self.cached_focused_match = None;
+            return;
+        };
         let mut current_idx = 0;
 
         // Determine grid iteration order within each terminal block.
@@ -536,13 +662,14 @@ impl AsyncFindController {
         // of the blocklist (newest blocks, near the prompt) come first.
         ordered_blocks.sort_by(|a, b| b.0.cmp(&a.0));
 
+        let reverse_within_block = matches!(
+            self.block_sort_direction,
+            BlockSortDirection::MostRecentLast
+        );
+
         for (_, block_info) in &ordered_blocks {
             match block_info {
                 BlockInfo::Terminal { block_index, .. } => {
-                    let reverse_within_grid = matches!(
-                        self.block_sort_direction,
-                        BlockSortDirection::MostRecentLast
-                    );
                     for &grid_type in &grid_types {
                         if let Some(matches) = self
                             .block_results
@@ -551,36 +678,66 @@ impl AsyncFindController {
                         {
                             // For MostRecentLast, sync focus traversal
                             // iterates from the bottom of each grid first.
+                            // Filter-hidden matches are skipped so the global
+                            // focus index maps only to visible matches, keeping
+                            // it consistent with `match_count`.
                             let iter: Box<dyn Iterator<Item = &AbsoluteMatch>> =
-                                if reverse_within_grid {
-                                    Box::new(matches.iter().rev())
+                                if reverse_within_block {
+                                    Box::new(matches.iter().rev().filter(|m| !m.is_filtered))
                                 } else {
-                                    Box::new(matches.iter())
+                                    Box::new(matches.iter().filter(|m| !m.is_filtered))
                                 };
                             for match_range in iter {
                                 if current_idx == focused_idx {
-                                    return Some(AsyncBlockGridMatch {
-                                        block_index: *block_index,
-                                        grid_type,
-                                        range: match_range.clone(),
-                                    });
+                                    self.cached_focused_match = Some(
+                                        FocusedMatchResolution::Terminal(AsyncBlockGridMatch {
+                                            block_index: *block_index,
+                                            grid_type,
+                                            range: match_range.clone(),
+                                        }),
+                                    );
+                                    return;
                                 }
                                 current_idx += 1;
                             }
                         }
                     }
                 }
-                BlockInfo::RichContent { view_id, .. } => {
-                    // Count AI matches so the index arithmetic stays correct,
-                    // but don't return them as terminal matches.
+                BlockInfo::RichContent {
+                    view_id,
+                    total_index,
+                } => {
                     if let Some(ai_matches) = self.block_results.ai_matches.get(view_id) {
-                        current_idx += ai_matches.len();
+                        // Mirror sync find's per-AI-block traversal order. Sync
+                        // reverses rich-content match ids for MostRecentLast so
+                        // that matches inside one AI block are walked from
+                        // bottom to top; we apply the same reversal at iteration
+                        // time to keep stored order canonical.
+                        let iter: Box<dyn Iterator<Item = &RichContentMatchId>> =
+                            if reverse_within_block {
+                                Box::new(ai_matches.iter().rev())
+                            } else {
+                                Box::new(ai_matches.iter())
+                            };
+                        for &match_id in iter {
+                            if current_idx == focused_idx {
+                                self.cached_focused_match =
+                                    Some(FocusedMatchResolution::Ai(AsyncFocusedAiMatch {
+                                        view_id: *view_id,
+                                        match_id,
+                                        total_index: *total_index,
+                                    }));
+                                return;
+                            }
+                            current_idx += 1;
+                        }
                     }
                 }
             }
         }
 
-        None
+        // No match at the focused index (index out of range).
+        self.cached_focused_match = None;
     }
 
     /// Registers a rich content view for AI block searching.
@@ -614,16 +771,14 @@ impl AsyncFindController {
         // Check for query refinement optimization.
         if let (Some(current_config), Some(new_query)) =
             (&self.current_config, options.query.as_ref())
+            && !options.is_regex_enabled
+            && !current_config.is_regex_enabled
+            && options.is_case_sensitive == current_config.is_case_sensitive
+            && is_query_refinement(&current_config.query, new_query)
         {
-            if !options.is_regex_enabled
-                && !current_config.is_regex_enabled
-                && options.is_case_sensitive == current_config.is_case_sensitive
-                && is_query_refinement(&current_config.query, new_query)
-            {
-                // New query is a refinement of the old query — filter existing results.
-                self.filter_results_for_refinement(options, block_sort_direction, ctx);
-                return;
-            }
+            // New query is a refinement of the old query — filter existing results.
+            self.filter_results_for_refinement(options, block_sort_direction, ctx);
+            return;
         }
 
         // Create new config.
@@ -742,7 +897,10 @@ impl AsyncFindController {
                         self.focused_match_index = Some(0);
                     }
 
-                    self.clamp_focused_match_index();
+                    // Mark any of the newly-arrived output matches that fall in
+                    // filter-hidden rows so they're excluded from the count,
+                    // focus, and highlights (also re-clamps focus).
+                    self.recompute_filtered_for_block(block_index);
                 }
             }
             FindTaskMessage::DirtyRangeMatches {
@@ -761,36 +919,38 @@ impl AsyncFindController {
                 // Dirty range messages arrive when the active block receives
                 // new output, which is exactly when truncation can occur.
                 self.prune_truncated_matches(block_index, grid_type);
-                self.clamp_focused_match_index();
+                // Recompute filter-hidden state for the (possibly updated)
+                // output matches; also re-clamps the focused index.
+                self.recompute_filtered_for_block(block_index);
             }
             FindTaskMessage::ScanAIBlock {
                 view_id,
                 total_index,
             } => {
                 // Scan AI block on main thread.
-                if let Some(view) = self.rich_content_views.get(&view_id) {
-                    if let Some(config) = &self.current_config {
-                        let options = FindOptions {
-                            query: Some(config.query.clone()),
-                            is_case_sensitive: config.is_case_sensitive,
-                            is_regex_enabled: config.is_regex_enabled,
-                            blocks_to_include_in_results: None,
-                        };
-                        let start = instant::Instant::now();
-                        let match_ids = view.run_find(&options, ctx);
-                        let elapsed = start.elapsed();
-                        log::trace!(
-                            "[async_find] AI block scan took {}ms for view_id={:?}",
-                            elapsed.as_millis(),
-                            view_id
-                        );
-                        if !match_ids.is_empty() {
-                            self.block_results.ai_matches.insert(view_id, match_ids);
-                            self.block_results
-                                .ai_total_indices
-                                .insert(view_id, total_index);
-                            self.clamp_focused_match_index();
-                        }
+                if let Some(view) = self.rich_content_views.get(&view_id)
+                    && let Some(config) = &self.current_config
+                {
+                    let options = FindOptions {
+                        query: Some(config.query.clone()),
+                        is_case_sensitive: config.is_case_sensitive,
+                        is_regex_enabled: config.is_regex_enabled,
+                        blocks_to_include_in_results: None,
+                    };
+                    let start = instant::Instant::now();
+                    let match_ids = view.run_find(&options, ctx);
+                    let elapsed = start.elapsed();
+                    log::trace!(
+                        "[async_find] AI block scan took {}ms for view_id={:?}",
+                        elapsed.as_millis(),
+                        view_id
+                    );
+                    if !match_ids.is_empty() {
+                        self.block_results.ai_matches.insert(view_id, match_ids);
+                        self.block_results
+                            .ai_total_indices
+                            .insert(view_id, total_index);
+                        self.clamp_focused_match_index();
                     }
                 }
             }
@@ -938,6 +1098,49 @@ impl AsyncFindController {
         }
     }
 
+    /// Recomputes `is_filtered` for the Output-grid matches of `block_index`,
+    /// mirroring the sync path's `update_matches_for_filtered_block`: an output
+    /// match is filtered out when its row is hidden by an active block filter.
+    /// Command and AI matches are never filtered. When no filter is active,
+    /// `is_displayed_row` returns `true` for every row, so nothing is filtered.
+    ///
+    /// Filtered matches are treated as if they don't exist for search — they are
+    /// excluded from the match count, focus traversal, and highlight rendering.
+    pub(crate) fn recompute_filtered_for_block(&mut self, block_index: BlockIndex) {
+        {
+            let model = self.terminal_model.lock();
+            let Some(block) = model.block_list().block_at(block_index) else {
+                return;
+            };
+            let grid_handler = block.output_grid().grid_handler();
+            let num_lines_truncated = grid_handler.num_lines_truncated();
+            if let Some(matches) = self
+                .block_results
+                .terminal_matches
+                .get_mut(&(block_index, GridType::Output))
+            {
+                for absolute_match in matches.iter_mut() {
+                    // Convert the absolute row back to the grid's *original*
+                    // (unfiltered) row index and check whether that row is
+                    // currently displayed. We intentionally do NOT use
+                    // `AbsoluteMatch::to_point`/`to_range` here: those translate
+                    // into *displayed* coordinates when a filter is active,
+                    // whereas `is_displayed_row` expects an original row index.
+                    absolute_match.is_filtered =
+                        match absolute_match.start.row.checked_sub(num_lines_truncated) {
+                            Some(original_row) => {
+                                !grid_handler.is_displayed_row(original_row as usize)
+                            }
+                            // Truncated from scrollback — treat as hidden/gone.
+                            None => true,
+                        };
+                }
+            }
+        }
+        // Filtering can change the visible match count, so re-clamp focus.
+        self.clamp_focused_match_index();
+    }
+
     /// Clamps the focused match index to the current match count.
     ///
     /// If the count is 0, sets the index to `None`. This should be called after
@@ -1059,10 +1262,10 @@ impl AsyncFindController {
         ctx.spawn_stream_local(
             result_rx,
             move |me, msg, ctx| {
-                if let Some(controller) = &mut me.async_find_controller {
-                    if controller.generation == generation {
-                        controller.process_message(msg, ctx);
-                    }
+                if let Some(controller) = &mut me.async_find_controller
+                    && controller.generation == generation
+                {
+                    controller.process_message(msg, ctx);
                 }
             },
             |_me, _ctx| {},

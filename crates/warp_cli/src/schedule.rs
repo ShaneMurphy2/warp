@@ -20,6 +20,17 @@ pub struct ScheduleCommand {
 }
 
 impl ScheduleCommand {
+    pub(crate) fn as_str_for_tracing(&self) -> &'static str {
+        match self.subcommand() {
+            Some(ScheduleSubcommand::Create(_)) | None => "schedule create",
+            Some(ScheduleSubcommand::List) => "schedule list",
+            Some(ScheduleSubcommand::Get(_)) => "schedule get",
+            Some(ScheduleSubcommand::Update(_)) => "schedule update",
+            Some(ScheduleSubcommand::Pause(_)) => "schedule pause",
+            Some(ScheduleSubcommand::Unpause(_)) => "schedule unpause",
+            Some(ScheduleSubcommand::Delete(_)) => "schedule delete",
+        }
+    }
     /// Get the specific scheduling subcommand. Returns `None` if using the `oz schedule` creation shorthand.
     pub fn subcommand(&self) -> Option<&ScheduleSubcommand> {
         self.subcommand.as_ref()
@@ -114,7 +125,7 @@ pub struct CreateScheduleArgs {
     ///
     /// When used with --prompt, the skill provides the base context and the prompt is the user task.
     /// This is useful for running recurring workflows like code reviews, dependency updates, or reports.
-    #[arg(long = "skill", value_name = "SPEC")]
+    #[arg(long = "skill", value_name = "SKILL")]
     pub skill: Option<SkillSpec>,
 
     /// Where this job should be hosted.
@@ -186,7 +197,7 @@ pub struct UpdateScheduleArgs {
     ///
     /// Skills are searched in `.agents/skills/`, `.warp/skills/`, `.claude/skills/`, and `.codex/skills/` directories.
     /// The skill is resolved at runtime in the agent's cloud environment.
-    #[arg(long = "skill", value_name = "SPEC", conflicts_with = "remove_skill")]
+    #[arg(long = "skill", value_name = "SKILL", conflicts_with = "remove_skill")]
     pub skill: Option<SkillSpec>,
 
     /// Remove the skill from this scheduled agent.

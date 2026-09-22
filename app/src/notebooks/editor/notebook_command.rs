@@ -13,16 +13,20 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{self, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use ui_components::lightbox::{LightboxImage, LightboxImageSource};
 use warp_completer::signatures::CommandRegistry;
+use warp_core::r#async::debounce;
 use warp_editor::content::anchor::Anchor;
 use warp_editor::content::buffer::{Buffer, BufferEvent, EditOrigin};
+use warp_editor::content::mermaid_diagram::mermaid_asset_source;
 use warp_editor::content::selection_model::BufferSelectionModel;
 use warp_editor::content::text::{
-    BlockType, BufferBlockStyle, CodeBlockType, CODE_BLOCK_DEFAULT_DISPLAY_LANG,
-    CODE_BLOCK_SHELL_DISPLAY_LANG,
+    BlockType, BufferBlockStyle, CODE_BLOCK_DEFAULT_DISPLAY_LANG, CODE_BLOCK_SHELL_DISPLAY_LANG,
+    CodeBlockType,
 };
 use warp_editor::editor::RunnableCommandModel;
 use warp_util::user_input::UserInput;
+use warpui::r#async::SpawnedFutureHandle;
 use warpui::elements::{
     Align, Border, Container, CornerRadius, CrossAxisAlignment, Empty, Flex, MainAxisAlignment,
     MouseStateHandle, ParentElement, Radius, Shrinkable, Text,
@@ -30,7 +34,6 @@ use warpui::elements::{
 use warpui::fonts::Properties;
 use warpui::platform::Cursor;
 use warpui::presenter::ChildView;
-use warpui::r#async::SpawnedFutureHandle;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::{
     AppContext, AssetProvider as _, Element, Entity, ModelAsRef, ModelContext, ModelHandle,
@@ -38,13 +41,13 @@ use warpui::{
 };
 
 use super::interaction_state_model::InteractionStateModel;
-use super::keys::{custom_action_to_display, NotebookKeybindings};
+use super::keys::{NotebookKeybindings, custom_action_to_display};
 use super::model::ChildModelHandle;
 use super::view::EditorViewAction;
-use super::{rich_text_styles, NotebookWorkflow};
+use super::{NotebookWorkflow, rich_text_styles};
+use crate::ASSETS;
 use crate::appearance::Appearance;
 use crate::completer::SessionAgnosticContext;
-use crate::debounce::debounce;
 use crate::drive::workflows::arguments::ArgumentsState;
 use crate::editor::InteractionState;
 use crate::features::FeatureFlag;
@@ -53,20 +56,20 @@ use crate::notebooks::file::MarkdownDisplayMode;
 use crate::notebooks::styles::block_footer_action_button;
 use crate::notebooks::telemetry::{ActionEntrypoint, BlockInfo};
 use crate::settings::FontSettings;
-use crate::terminal::input::decorations::{
-    parse_current_commands_and_tokens, ParsedTokenData, ParsedTokensSnapshot,
-};
 use crate::terminal::input::DEBOUNCE_INPUT_DECORATION_PERIOD;
+use crate::terminal::input::decorations::{
+    ParsedTokenData, ParsedTokensSnapshot, parse_current_commands_and_tokens,
+};
 use crate::themes::theme::{AnsiColorIdentifier, AnsiColors};
 use crate::ui_components::buttons::icon_button;
 use crate::ui_components::icons::Icon;
 use crate::util::bindings::CustomAction;
 use crate::util::color::{ContrastingColor, MinimumAllowedContrast};
-use crate::view_components::dropdown::DropdownAction;
 use crate::view_components::Dropdown;
-use crate::workflows::workflow::Workflow;
+use crate::view_components::dropdown::DropdownAction;
 use crate::workflows::WorkflowType;
-use crate::ASSETS;
+use crate::workflows::workflow::Workflow;
+use crate::workspace::WorkspaceAction;
 
 lazy_static! {
     static ref SUPPORTED_LANGUAGES: &'static [&'static str] = &[
@@ -91,6 +94,7 @@ struct MouseStateHandles {
     copy_button_state: MouseStateHandle,
     mermaid_raw_button_state: MouseStateHandle,
     mermaid_rendered_button_state: MouseStateHandle,
+    mermaid_fullscreen_button_state: MouseStateHandle,
 }
 
 struct CachedHighlightKey {
@@ -191,7 +195,7 @@ impl NotebookCommand {
             dropdown.set_rich_items(
                 CodeBlockType::all().map(|code_block_type| {
                     let mut item = MenuItemFields::new(code_block_type.to_string())
-                        .with_on_select_action(DropdownAction::SelectActionAndClose(
+                        .with_on_select_action(DropdownAction::select_action_and_close(
                             EditorViewAction::CodeBlockTypeSelectedAtOffset {
                                 code_block_type: code_block_type.clone(),
                                 start_anchor: start.clone(),
@@ -219,17 +223,18 @@ impl NotebookCommand {
 
         let syntax_config = {
             let ps = SyntaxSet::load_defaults_newlines();
-            if let Ok(asset) = ASSETS.get("bundled/syntax_theme/base16.tmTheme") {
-                let mut cursor = std::io::Cursor::new(asset);
-                match ThemeSet::load_from_reader(&mut cursor) {
-                    Ok(theme) => Some((ps, theme)),
-                    Err(e) => {
-                        log::debug!("Failed to load theme set from asset: {e}");
-                        None
+            match ASSETS.get("bundled/syntax_theme/base16.tmTheme") {
+                Ok(asset) => {
+                    let mut cursor = std::io::Cursor::new(asset);
+                    match ThemeSet::load_from_reader(&mut cursor) {
+                        Ok(theme) => Some((ps, theme)),
+                        Err(e) => {
+                            log::debug!("Failed to load theme set from asset: {e}");
+                            None
+                        }
                     }
                 }
-            } else {
-                None
+                _ => None,
             }
         };
 
@@ -286,7 +291,6 @@ impl NotebookCommand {
         self.start.clone()
     }
 
-    // Returns the CodeBlockType of this command
     fn code_block_type(&self, ctx: &AppContext) -> CodeBlockType {
         if let Some(offset) = self.end_offset(ctx) {
             NotebookCommand::block_type_to_code_type(
@@ -295,6 +299,16 @@ impl NotebookCommand {
         } else {
             Default::default()
         }
+    }
+
+    pub(crate) fn is_rendered_mermaid(&self, ctx: &AppContext) -> bool {
+        matches!(self.code_block_type(ctx), CodeBlockType::Mermaid)
+            && matches!(self.mermaid_display_mode, MarkdownDisplayMode::Rendered)
+    }
+
+    #[cfg(feature = "integration_tests")]
+    pub(crate) fn is_shell_command(&self, ctx: &AppContext) -> bool {
+        matches!(self.code_block_type(ctx), CodeBlockType::Shell)
     }
 
     #[cfg(test)]
@@ -463,7 +477,12 @@ impl NotebookCommand {
         });
     }
 
-    fn on_buffer_content_updated(&mut self, event: &BufferEvent, ctx: &mut ModelContext<Self>) {
+    fn on_buffer_content_updated(
+        &mut self,
+        _: ModelHandle<Buffer>,
+        event: &BufferEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
         // If the buffer changes, check to see if we should update the dropdown
         match event {
             BufferEvent::ContentChanged { origin, delta, .. }
@@ -722,6 +741,42 @@ impl RunnableCommandModel for NotebookCommand {
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
                 .finish(),
             );
+
+            if !is_raw {
+                let fullscreen_model = self.handle.clone();
+                footer.add_child(
+                    Align::new(
+                        block_footer_action_button(
+                            appearance,
+                            Icon::Maximize,
+                            self.mouse_state_handles
+                                .mermaid_fullscreen_button_state
+                                .clone(),
+                            "Open full screen",
+                            None,
+                        )
+                        .on_click(move |ctx, app, _| {
+                            if let Some(command_model) = fullscreen_model.upgrade(app)
+                                && let Some(source) = command_model.as_ref(app).command(app)
+                                && !source.trim().is_empty()
+                            {
+                                ctx.dispatch_typed_action(WorkspaceAction::OpenLightbox {
+                                    images: vec![LightboxImage {
+                                        source: LightboxImageSource::Resolved {
+                                            asset_source: mermaid_asset_source(&source),
+                                        },
+                                        description: None,
+                                    }],
+                                    initial_index: 0,
+                                });
+                            }
+                        })
+                        .finish(),
+                    )
+                    .right()
+                    .finish(),
+                );
+            }
         }
         footer.add_child(Shrinkable::new(1.0, Empty::new().finish()).finish());
         footer.add_child(
@@ -734,14 +789,14 @@ impl RunnableCommandModel for NotebookCommand {
                     custom_action_to_display(CustomAction::Copy),
                 )
                 .on_click(move |ctx, app, _| {
-                    if let Some(command_model) = model.upgrade(app) {
-                        if let Some(block_content) = command_model.as_ref(app).command(app) {
-                            ctx.dispatch_typed_action(EditorViewAction::CopyTextToClipboard {
-                                text: UserInput::new(block_content.trim()),
-                                block: BlockInfo::CodeBlock,
-                                entrypoint: ActionEntrypoint::Button,
-                            });
-                        }
+                    if let Some(command_model) = model.upgrade(app)
+                        && let Some(block_content) = command_model.as_ref(app).command(app)
+                    {
+                        ctx.dispatch_typed_action(EditorViewAction::CopyTextToClipboard {
+                            text: UserInput::new(block_content.trim()),
+                            block: BlockInfo::CodeBlock,
+                            entrypoint: ActionEntrypoint::Button,
+                        });
                     }
                 })
                 .finish(),
@@ -761,10 +816,10 @@ impl RunnableCommandModel for NotebookCommand {
                         NotebookKeybindings::as_ref(ctx).run_commands_keybinding(),
                     )
                     .on_click(move |ctx, app, _| {
-                        if let Some(command_model) = model.upgrade(app) {
-                            if let Some(workflow) = command_model.as_ref(app).to_workflow(app) {
-                                ctx.dispatch_typed_action(EditorViewAction::RunWorkflow(workflow));
-                            }
+                        if let Some(command_model) = model.upgrade(app)
+                            && let Some(workflow) = command_model.as_ref(app).to_workflow(app)
+                        {
+                            ctx.dispatch_typed_action(EditorViewAction::RunWorkflow(workflow));
                         }
                     })
                     .finish(),

@@ -2,14 +2,15 @@ use warp_core::features::FeatureFlag;
 use warpui::{SingletonEntity, ViewContext};
 
 use super::rich_content::RichContentMetadata;
-use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::CancellationReason;
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::blocklist::QueuedQueryModel;
 use crate::ai::blocklist::block::{
     FinishReason, PendingUserQueryBlock, PendingUserQueryBlockEvent,
 };
 use crate::auth::AuthStateProvider;
-use crate::terminal::view::PendingUserQueryKind;
 use crate::terminal::TerminalView;
+use crate::terminal::view::PendingUserQueryKind;
 
 impl TerminalView {
     pub(super) fn pending_user_query_conversation_id(&self) -> Option<AIConversationId> {
@@ -101,6 +102,25 @@ impl TerminalView {
         );
     }
 
+    pub(in crate::terminal::view) fn remove_cloud_mode_queue_row(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !FeatureFlag::QueuedPromptsV2.is_enabled() {
+            return;
+        }
+        let Some(conversation_id) = self
+            .ai_context_model
+            .as_ref(ctx)
+            .selected_conversation_id(ctx)
+        else {
+            return;
+        };
+        QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
+            model.remove_initial_cloud_mode_row(conversation_id, ctx);
+        });
+    }
+
     /// Removes the pending user query block, if one exists. No-op if none is present.
     /// Also cancels the queued prompt callback so the prompt is not sent.
     /// (Safe to call from within the callback itself — the caller `.take()`s it first.)
@@ -147,7 +167,7 @@ impl TerminalView {
         }
 
         self.input.update(ctx, |input, ctx| {
-            input.submit_queued_prompt(prompt, ctx);
+            input.submit_user_query_now(prompt, ctx);
         });
     }
 
@@ -168,6 +188,16 @@ impl TerminalView {
         show_send_now_button: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        if self.queued_prompt_callback.is_some() {
+            log::warn!(
+                "event=legacy_queued_prompt_replaced terminal_id={:?} conversation_id={:?} queued_prompts_v2={}",
+                self.view_id,
+                self.ai_context_model
+                    .as_ref(ctx)
+                    .selected_conversation_id(ctx),
+                FeatureFlag::QueuedPromptsV2.is_enabled(),
+            );
+        }
         if FeatureFlag::PendingUserQueryIndicator.is_enabled() {
             self.insert_pending_user_query_block(
                 prompt.clone(),
@@ -179,13 +209,18 @@ impl TerminalView {
         }
         // Replace any previously queued prompt so the latest one always wins.
         self.queued_prompt_callback = Some(Box::new(move |terminal_view, reason, ctx| {
+            log::info!(
+                "event=legacy_queue_callback_fired terminal_id={:?} success={}",
+                terminal_view.view_id,
+                matches!(reason, FinishReason::Complete),
+            );
             if FeatureFlag::PendingUserQueryIndicator.is_enabled() {
                 terminal_view.remove_pending_user_query_block(ctx);
             }
             match reason {
                 FinishReason::Complete => {
                     terminal_view.input.update(ctx, |input, ctx| {
-                        input.submit_queued_prompt(prompt, ctx);
+                        input.submit_user_query_now(prompt, ctx);
                     });
                 }
                 FinishReason::Error

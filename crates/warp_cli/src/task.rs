@@ -1,10 +1,13 @@
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 
+use crate::SortOrderArg;
 use crate::date_time::parse_rfc3339;
 use crate::json_filter::JsonOutput;
+use crate::scope::TeamSelection;
 
 /// Task-related subcommands.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum TaskCommand {
     /// List ambient agent tasks.
@@ -17,6 +20,17 @@ pub enum TaskCommand {
     /// Messages sent to and from runs.
     #[command(subcommand)]
     Message(MessageCommand),
+}
+
+impl TaskCommand {
+    pub(crate) fn as_str_for_tracing(&self) -> &'static str {
+        match self {
+            TaskCommand::List(_) => "run list",
+            TaskCommand::Get(_) => "run get",
+            TaskCommand::Conversation(_) => "run conversation",
+            TaskCommand::Message(_) => "run message",
+        }
+    }
 }
 
 /// Conversation-related subcommands.
@@ -118,6 +132,8 @@ pub struct MessageDeliveredArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ListTasksArgs {
+    #[command(flatten)]
+    pub team_selection: TeamSelection,
     /// Maximum number of tasks to return (default: 10).
     #[arg(short = 'L', long = "limit", default_value = "10")]
     pub limit: i32,
@@ -142,8 +158,8 @@ pub struct ListTasksArgs {
     #[arg(long = "environment", value_name = "ENV_ID")]
     pub environment: Option<String>,
 
-    /// Filter by skill specification (e.g. `owner/repo:path/to/SKILL.md`).
-    #[arg(long = "skill", value_name = "SPEC")]
+    /// Filter by skill (e.g. `owner/repo:path/to/SKILL.md`).
+    #[arg(long = "skill", value_name = "SKILL")]
     pub skill: Option<String>,
 
     /// Filter to runs created by a specific scheduled agent.
@@ -188,7 +204,7 @@ pub struct ListTasksArgs {
 
     /// Sort direction.
     #[arg(long = "sort-order", value_enum, value_name = "DIR")]
-    pub sort_order: Option<RunSortOrderArg>,
+    pub sort_order: Option<SortOrderArg>,
 
     /// Opaque pagination cursor from a previous list response.
     ///
@@ -281,15 +297,6 @@ pub enum RunSortByArg {
     Title,
     #[value(name = "agent")]
     Agent,
-}
-
-/// Sort-order values accepted by `--sort-order`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum RunSortOrderArg {
-    #[value(name = "asc")]
-    Asc,
-    #[value(name = "desc")]
-    Desc,
 }
 
 #[derive(Debug, Clone, Args)]

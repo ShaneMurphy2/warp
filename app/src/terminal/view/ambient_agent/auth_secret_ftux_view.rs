@@ -1,7 +1,7 @@
 use warp_cli::agent::Harness;
 use warp_core::ui::appearance::Appearance;
-use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::Fill;
+use warp_core::ui::theme::color::internal_colors;
 use warp_editor::editor::NavigationKey;
 use warp_managed_secrets::client::SecretOwner;
 use warpui::elements::{
@@ -14,11 +14,12 @@ use warpui::fonts::{Properties, Weight};
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
+    WeakViewHandle,
 };
 
 use crate::ai::auth_secret_types::{
-    auth_secret_types_for_harness, build_managed_secret_value, learn_more_url_for_harness,
-    AuthSecretTypeInfo,
+    AuthSecretTypeInfo, auth_secret_types_for_harness, build_managed_secret_value,
+    learn_more_url_for_harness,
 };
 use crate::ai::harness_availability::{HarnessAvailabilityEvent, HarnessAvailabilityModel};
 use crate::ai::harness_display;
@@ -33,7 +34,7 @@ use crate::terminal::view::ambient_agent::auth_secret_ftux_dropdown::{
 use crate::ui_components::icons::Icon as UiIcon;
 use crate::view_components::DismissibleToast;
 use crate::workspace::ToastStack;
-use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 
 const DESCRIPTION_FONT_SIZE: f32 = 14.;
 
@@ -107,7 +108,18 @@ struct SecretCreationState {
     pending_name: Option<String>,
 }
 
+/// Validated, ready-to-submit snapshot of the creation form.
+struct ValidatedForm {
+    harness: Harness,
+    info: &'static AuthSecretTypeInfo,
+    /// Trimmed; non-empty.
+    name: String,
+    /// One per `info.fields`. Required fields are non-empty after trimming.
+    field_values: Vec<String>,
+}
+
 pub struct AuthSecretFtuxView {
+    view_handle: WeakViewHandle<Self>,
     harness: Harness,
     ftux_dropdown: ViewHandle<AuthSecretFtuxDropdown>,
     name_editor: ViewHandle<EditorView>,
@@ -136,7 +148,7 @@ impl AuthSecretFtuxView {
         let name_editor = make_single_line_editor(Some("e.g. My API Key"), false, ctx);
 
         ctx.subscribe_to_view(&name_editor, |me, _, event, ctx| {
-            me.handle_form_editor_nav(0, event, ctx);
+            me.handle_form_editor_event(0, event, ctx);
         });
 
         let ftux_dropdown =
@@ -145,8 +157,9 @@ impl AuthSecretFtuxView {
         ctx.subscribe_to_view(&ftux_dropdown, |me, _, event, ctx| {
             if matches!(event, FtuxDropdownEvent::Opened) {
                 let harness = me.harness;
+                let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
                 HarnessAvailabilityModel::handle(ctx).update(ctx, |model, ctx| {
-                    model.ensure_auth_secrets_fetched(harness, ctx);
+                    model.ensure_auth_secrets_fetched(&team_scope, harness, ctx);
                 });
             }
         });
@@ -223,12 +236,26 @@ impl AuthSecretFtuxView {
                     }
                 }
                 HarnessAvailabilityEvent::Changed
-                | HarnessAvailabilityEvent::AuthSecretsLoaded
-                | HarnessAvailabilityEvent::AuthSecretsFetchFailed => {}
+                | HarnessAvailabilityEvent::AuthSecretsChanged
+                | HarnessAvailabilityEvent::AuthSecretDeleted { .. }
+                | HarnessAvailabilityEvent::AuthSecretDeletionFailed { .. } => {}
             },
         );
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |me, _, event, ctx| {
+            let affects_window = matches!(event, UserWorkspacesEvent::TeamsChanged)
+                || matches!(
+                    event,
+                    UserWorkspacesEvent::WindowTeamChanged { window_id }
+                        if *window_id == ctx.window_id()
+                );
+            if affects_window {
+                me.clear_creation_state(ctx);
+                ctx.notify();
+            }
+        });
 
         Self {
+            view_handle: ctx.handle(),
             harness,
             ftux_dropdown,
             name_editor,
@@ -444,18 +471,18 @@ impl AuthSecretFtuxView {
 
         let mut stack = Stack::new();
         stack.add_child(trigger);
-        if self.is_harness_menu_open {
-            if let Some(menu) = &self.harness_menu {
-                stack.add_positioned_overlay_child(
-                    ChildView::new(menu).finish(),
-                    OffsetPositioning::offset_from_parent(
-                        warpui::geometry::vector::vec2f(0., 4.),
-                        ParentOffsetBounds::WindowByPosition,
-                        ParentAnchor::BottomLeft,
-                        ChildAnchor::TopLeft,
-                    ),
-                );
-            }
+        if self.is_harness_menu_open
+            && let Some(menu) = &self.harness_menu
+        {
+            stack.add_positioned_overlay_child(
+                ChildView::new(menu).finish(),
+                OffsetPositioning::offset_from_parent(
+                    warpui::geometry::vector::vec2f(0., 4.),
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::BottomLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
         }
         stack.finish()
     }
@@ -498,7 +525,7 @@ impl AuthSecretFtuxView {
         }
     }
 
-    fn handle_form_editor_nav(
+    fn handle_form_editor_event(
         &self,
         editor_index: usize,
         event: &EditorEvent,
@@ -523,6 +550,8 @@ impl AuthSecretFtuxView {
                 }
                 _ => {}
             },
+            // Re-render so the Continue button restyles as the user types.
+            EditorEvent::Edited(_) => ctx.notify(),
             _other => {}
         }
     }
@@ -543,7 +572,7 @@ impl AuthSecretFtuxView {
             let editor = make_single_line_editor(Some(placeholder), field.sensitive, ctx);
             let editor_index = field_idx + 1;
             ctx.subscribe_to_view(&editor, move |me, _, event, ctx| {
-                me.handle_form_editor_nav(editor_index, event, ctx);
+                me.handle_form_editor_event(editor_index, event, ctx);
             });
             editors.push(editor);
         }
@@ -567,6 +596,50 @@ impl AuthSecretFtuxView {
         auth_secret_types_for_harness(state.harness).get(state.secret_type_index)
     }
 
+    /// Validated form snapshot; `None` if not ready to submit. Single
+    /// source of truth for both `can_submit_creation_form` and
+    /// `handle_continue`.
+    fn validated_form_snapshot(&self, ctx: &AppContext) -> Option<ValidatedForm> {
+        let state = self.creation_state.as_ref()?;
+        if state.is_saving {
+            return None;
+        }
+        let info = auth_secret_types_for_harness(state.harness).get(state.secret_type_index)?;
+        if self.field_editors.len() != info.fields.len() {
+            return None;
+        }
+        let name = self
+            .name_editor
+            .as_ref(ctx)
+            .buffer_text(ctx)
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let field_values: Vec<String> = self
+            .field_editors
+            .iter()
+            .map(|e| e.as_ref(ctx).buffer_text(ctx))
+            .collect();
+        for (field, value) in info.fields.iter().zip(field_values.iter()) {
+            if !field.optional && value.trim().is_empty() {
+                return None;
+            }
+        }
+        Some(ValidatedForm {
+            harness: state.harness,
+            info,
+            name,
+            field_values,
+        })
+    }
+
+    /// Whether the Continue button should be enabled.
+    fn can_submit_creation_form(&self, ctx: &AppContext) -> bool {
+        self.validated_form_snapshot(ctx).is_some()
+    }
+
     fn handle_skip(&mut self, ctx: &mut ViewContext<Self>) {
         if self.skip_hidden {
             return;
@@ -587,39 +660,23 @@ impl AuthSecretFtuxView {
     }
 
     fn handle_continue(&mut self, ctx: &mut ViewContext<Self>) {
-        let Some(state) = self.creation_state.as_ref() else {
+        // The button is disabled when the form isn't ready; no-op if we
+        // got dispatched anyway.
+        let Some(form) = self.validated_form_snapshot(ctx) else {
             return;
         };
-        if state.is_saving {
-            return;
-        }
-        let harness = state.harness;
-        let type_index = state.secret_type_index;
-        let Some(info) = auth_secret_types_for_harness(harness).get(type_index) else {
-            return;
-        };
-
-        let name = self.name_editor.as_ref(ctx).buffer_text(ctx);
-        let trimmed_name = name.trim();
-        if trimmed_name.is_empty() {
-            HarnessAvailabilityModel::handle(ctx).update(ctx, |_model, ctx| {
-                ctx.emit(HarnessAvailabilityEvent::AuthSecretCreationFailed {
-                    error: "Please enter a name for the secret.".to_string(),
-                });
-            });
-            return;
-        }
-        let name = trimmed_name.to_string();
-
-        let field_values: Vec<String> = self
-            .field_editors
-            .iter()
-            .map(|e| e.as_ref(ctx).buffer_text(ctx))
-            .collect();
+        let ValidatedForm {
+            harness,
+            info,
+            name,
+            field_values,
+        } = form;
 
         let value = match build_managed_secret_value(info, &field_values) {
             Ok(v) => v,
             Err(err) => {
+                // Defensive: `validated_form_snapshot` already enforces
+                // the same required-field rules.
                 let msg = err.to_string();
                 HarnessAvailabilityModel::handle(ctx).update(ctx, |_model, ctx| {
                     ctx.emit(HarnessAvailabilityEvent::AuthSecretCreationFailed { error: msg });
@@ -634,19 +691,19 @@ impl AuthSecretFtuxView {
         }
         ctx.notify();
 
+        let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
         let owner = self.resolve_secret_owner(ctx);
         HarnessAvailabilityModel::handle(ctx).update(ctx, |model, ctx| {
-            model.create_auth_secret(harness, name, value, owner, ctx);
+            model.create_auth_secret(&team_scope, harness, name, value, owner, ctx);
         });
     }
-
     fn resolve_secret_owner(&self, ctx: &ViewContext<Self>) -> SecretOwner {
-        if self.share_with_team {
-            if let Some(team) = UserWorkspaces::as_ref(ctx).current_team() {
-                return SecretOwner::Team {
-                    team_uid: team.uid.uid(),
-                };
-            }
+        if self.share_with_team
+            && let Some(team) = UserWorkspaces::as_ref(ctx).team_for_view(ctx)
+        {
+            return SecretOwner::Team {
+                team_uid: team.uid.uid(),
+            };
         }
         SecretOwner::CurrentUser
     }
@@ -807,7 +864,9 @@ impl AuthSecretFtuxView {
     }
 
     fn render_scope_checkbox(&self, app: &AppContext) -> Box<dyn Element> {
-        let has_team = UserWorkspaces::as_ref(app).current_team().is_some();
+        let has_team = UserWorkspaces::as_ref(app)
+            .team_for_view_handle(&self.view_handle, app)
+            .is_some();
         if !has_team {
             return Empty::new().finish();
         }
@@ -888,24 +947,35 @@ impl AuthSecretFtuxView {
         mouse_state: MouseStateHandle,
         background: Option<Fill>,
         action: AuthSecretFtuxAction,
+        disabled: bool,
         app: &AppContext,
     ) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
         let font_family = appearance.ui_font_family();
-        let text_color = theme.foreground();
+        // Mirrors the design system's `DisabledTheme`.
+        let text_color = if disabled {
+            internal_colors::neutral_5(theme)
+        } else {
+            theme.foreground().into()
+        };
+        let effective_background = if disabled {
+            background.map(|_| Fill::from(internal_colors::neutral_4(theme)))
+        } else {
+            background
+        };
         Hoverable::new(mouse_state, move |_| {
             let inner = Container::new(
                 Text::new_inline(label.to_string(), font_family, BUTTON_FONT_SIZE)
                     .with_style(Properties::default().weight(Weight::Semibold))
-                    .with_color(text_color.into())
+                    .with_color(text_color)
                     .finish(),
             )
             .with_padding_left(BUTTON_PADDING * 2.)
             .with_padding_right(BUTTON_PADDING * 2.)
             .with_padding_top(BUTTON_PADDING)
             .with_padding_bottom(BUTTON_PADDING);
-            let inner = if let Some(background) = background {
+            let inner = if let Some(background) = effective_background {
                 inner
                     .with_background(background)
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(CORNER_RADIUS)))
@@ -914,8 +984,15 @@ impl AuthSecretFtuxView {
             };
             inner.finish()
         })
-        .with_cursor(warpui::platform::Cursor::PointingHand)
+        .with_cursor(if disabled {
+            warpui::platform::Cursor::Arrow
+        } else {
+            warpui::platform::Cursor::PointingHand
+        })
         .on_click(move |ctx, _, _| {
+            if disabled {
+                return;
+            }
             ctx.dispatch_typed_action(action.clone());
         })
         .finish()
@@ -935,15 +1012,18 @@ impl AuthSecretFtuxView {
             self.back_button_mouse_state.clone(),
             None,
             action,
+            false,
             app,
         ));
 
         let accent_fill = Appearance::as_ref(app).theme().accent();
+        let continue_disabled = !self.can_submit_creation_form(app);
         row.add_child(self.render_button(
             "Continue",
             self.continue_mouse_state.clone(),
             Some(accent_fill),
             AuthSecretFtuxAction::Continue,
+            continue_disabled,
             app,
         ));
 

@@ -1,10 +1,3 @@
-cfg_if::cfg_if! {
-    if #[cfg(feature = "v2")] {
-        mod v2;
-        pub use v2::*;
-    }
-}
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -14,7 +7,7 @@ use smol_str::SmolStr;
 use typed_path::{TypedPath, TypedPathBuf};
 use warp_core::command::ExitCode;
 use warp_util::path::{EscapeChar, ShellFamily};
-use warpui::platform::OperatingSystem;
+use warpui_core::platform::OperatingSystem;
 
 use super::engine::EngineDirEntry;
 use crate::completer::TopLevelCommandCaseSensitivity;
@@ -51,12 +44,6 @@ pub trait CompletionContext: Send + Sync {
                 EscapeChar::Backslash
             }
         }
-    }
-
-    #[cfg(feature = "v2")]
-    /// If JS execution is supported, should return an instance of `JsExecutionContext`.
-    fn js_context(&self) -> Option<&dyn JsExecutionContext> {
-        None
     }
 
     /// Returns top-level commands to be suggested when completing on an empty buffer.

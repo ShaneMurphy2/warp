@@ -16,9 +16,12 @@ pub(super) mod proxy;
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 
+use warp_errors::report_error;
+use warpui::SingletonEntity;
 use warpui::r#async::executor;
 
 use super::server_model::{ConnectionId, ServerModel};
+use crate::{TelemetryEvent, send_telemetry_from_app_ctx};
 
 /// Run the `remote-server-daemon` subcommand.
 ///
@@ -48,11 +51,11 @@ pub(crate) fn launch_daemon(identity_key: &str, ctx: &mut warpui::AppContext) {
     let socket_path = proxy::socket_path(identity_key);
     let pid_path = proxy::pid_path(identity_key);
 
-    if let Some(parent) = socket_path.parent() {
-        if let Err(e) = proxy::ensure_private_daemon_dir(parent) {
-            log::error!("Failed to create daemon directory: {e}");
-            return;
-        }
+    if let Some(parent) = socket_path.parent()
+        && let Err(e) = proxy::ensure_private_daemon_dir(parent)
+    {
+        report_error!(e.context("Failed to create daemon directory"));
+        return;
     }
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
@@ -61,13 +64,34 @@ pub(crate) fn launch_daemon(identity_key: &str, ctx: &mut warpui::AppContext) {
     let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
         Ok(l) => l,
         Err(e) => {
-            log::error!("Daemon: failed to bind socket: {e}");
+            report_error!(anyhow::Error::new(e).context("Daemon: failed to bind socket"));
             return;
         }
     };
     let _ = std::fs::set_permissions(&socket_path, Permissions::from_mode(0o600));
     listener.set_nonblocking(true).ok();
     log::info!("Daemon bound to {}", socket_path.display());
+
+    // Flush the accumulated IntervalTimer data as telemetry now that the
+    // daemon is ready to accept connections. The timer was created in
+    // `run_internal` and carries intervals from the full startup path
+    // (logging, SQLite, singleton models, etc.).
+    //
+    // All telemetry dependencies are ready at this point:
+    // `AppTelemetryContextProvider` and `AuthStateProvider` are
+    // registered during `initialize_app` (before `launch` calls us),
+    // and `TelemetryCollector` is already running its periodic flush.
+    // The flush sends directly to Rudderstack using a baked-in write
+    // key — no user auth token is required.
+    let timing_data =
+        warp_core::interval_timer::IntervalTimer::handle(ctx).update(ctx, |timer, _| {
+            timer.mark_interval_end("DAEMON_SOCKET_BOUND");
+            timer.compute_stats()
+        });
+    send_telemetry_from_app_ctx!(
+        TelemetryEvent::RemoteServerDaemonStartup { timing_data },
+        ctx
+    );
 
     let _ = std::fs::write(&pid_path, std::process::id().to_string());
 
@@ -81,7 +105,7 @@ pub(crate) fn launch_daemon(identity_key: &str, ctx: &mut warpui::AppContext) {
             let listener = match async_io::Async::new(listener) {
                 Ok(l) => l,
                 Err(e) => {
-                    log::error!("Daemon: async listener error: {e}");
+                    report_error!(anyhow::Error::new(e).context("Daemon: async listener error"));
                     return;
                 }
             };
@@ -100,7 +124,7 @@ pub(crate) fn launch_daemon(identity_key: &str, ctx: &mut warpui::AppContext) {
                             ))
                             .detach();
                     }
-                    Err(e) => log::error!("Daemon: accept error: {e}"),
+                    Err(e) => report_error!(anyhow::Error::new(e).context("Daemon: accept error")),
                 }
             }
         })
@@ -129,8 +153,8 @@ pub(super) async fn handle_daemon_connection(
     spawner: warpui::ModelSpawner<ServerModel>,
     exec: std::sync::Arc<executor::Background>,
 ) {
-    use futures::io::{AsyncWriteExt, BufReader, BufWriter};
     use futures::AsyncReadExt as _;
+    use futures::io::{AsyncWriteExt, BufReader, BufWriter};
 
     let (conn_tx, conn_rx) = async_channel::unbounded::<remote_server::proto::ServerMessage>();
 
@@ -180,7 +204,10 @@ pub(super) async fn handle_daemon_connection(
                             "Daemon: read error from conn {conn_id} (client disconnected): {e}"
                         );
                     } else {
-                        log::error!("Daemon: fatal read error from conn {conn_id}: {e}");
+                        report_error!(
+                            anyhow::Error::new(e).context("Daemon: fatal read error from conn"),
+                            extra: { "conn_id" => %conn_id }
+                        );
                     }
                     break;
                 }
@@ -205,7 +232,10 @@ pub(super) async fn handle_daemon_connection(
                 if is_disconnect_protocol_error(&e) {
                     log::warn!("Daemon: write error on conn {conn_id} (client disconnected): {e}");
                 } else {
-                    log::error!("Daemon: write error on conn {conn_id}: {e}");
+                    report_error!(
+                        anyhow::Error::new(e).context("Daemon: write error on conn"),
+                        extra: { "conn_id" => %conn_id }
+                    );
                 }
                 break;
             }
@@ -232,7 +262,11 @@ pub(super) async fn handle_daemon_connection(
                 remote_server::protocol::write_server_message(&mut writer, &error_msg).await
             {
                 if !e2.is_write_recoverable() {
-                    log::error!("Daemon: failed to send error response on conn {conn_id}: {e2}");
+                    report_error!(
+                        anyhow::Error::new(e2)
+                            .context("Daemon: failed to send error response on conn"),
+                        extra: { "conn_id" => %conn_id }
+                    );
                     break;
                 }
                 log::warn!("Daemon: failed to send error response on conn {conn_id}: {e2}");
@@ -246,7 +280,10 @@ pub(super) async fn handle_daemon_connection(
             if is_disconnect_io_error(&e) {
                 log::warn!("Daemon: flush error on conn {conn_id} (client disconnected): {e}");
             } else {
-                log::error!("Daemon: flush error on conn {conn_id}: {e}");
+                report_error!(
+                    anyhow::Error::new(e).context("Daemon: flush error on conn"),
+                    extra: { "conn_id" => %conn_id }
+                );
             }
             break;
         }

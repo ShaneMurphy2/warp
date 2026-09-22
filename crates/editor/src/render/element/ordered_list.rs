@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use warpui::elements::ListIndentLevel;
-use warpui::geometry::vector::vec2f;
-use warpui::text_layout::TextFrame;
+use warpui_core::elements::ListIndentLevel;
+use warpui_core::geometry::vector::vec2f;
+use warpui_core::text_layout::TextFrame;
 
 use super::RenderableBlock;
 use super::paint::RenderContext;
@@ -40,10 +40,10 @@ impl RenderableBlock for RenderableOrderedListItem {
     fn layout(
         &mut self,
         model: &RenderState,
-        ctx: &mut warpui::LayoutContext,
-        app: &warpui::AppContext,
+        ctx: &mut warpui_core::LayoutContext,
+        app: &warpui_core::AppContext,
     ) {
-        let text_layout = TextLayout::from_layout_context(ctx, app, model);
+        let text_layout = TextLayout::for_render_state(app, model);
         let block_style = BufferBlockStyle::OrderedList {
             indent_level: ListIndentLevel::One,
             number: None,
@@ -62,16 +62,24 @@ impl RenderableBlock for RenderableOrderedListItem {
             style_runs,
         ));
 
-        self.placeholder
-            .layout(&self.viewport_item, model, ctx, app, |_| {
-                placeholder::Options {
-                    block_style,
-                    text: "List",
-                }
-            });
+        self.placeholder.layout(
+            &self.viewport_item,
+            model,
+            ctx.text_layout_cache,
+            app,
+            |_| placeholder::Options {
+                block_style,
+                text: "List",
+            },
+        );
     }
 
-    fn paint(&mut self, model: &RenderState, ctx: &mut RenderContext, _app: &warpui::AppContext) {
+    fn paint(
+        &mut self,
+        model: &RenderState,
+        ctx: &mut RenderContext,
+        _app: &warpui_core::AppContext,
+    ) {
         let content = model.content();
         let paragraph = extract_block!(self.viewport_item, content, (block, BlockItem::OrderedList{ paragraph: inner, ..}) => block.ordered_list(inner));
 
