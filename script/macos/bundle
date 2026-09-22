@@ -216,7 +216,6 @@ DMG_NAME_SUFFIX=""
 RELEASE_CHANNEL="dev"
 FEATURES="release_bundle,cocoa_sentry,extern_plist"
 REGISTER_SERVICES=true
-CREATE_DMG=true
 DEBUG=false
 ARTIFACT="app"
 CODESIGN=true
@@ -294,11 +293,6 @@ while (( "$#" )); do
         echo "Error: Argument for $1 is missing" >&2
         exit 1
       fi
-      ;;
-    --skip-dmg)
-      echo "Skipping DMG creation."
-      CREATE_DMG=false
-      shift
       ;;
     # Open the parent directory after bundling completes.
     -o|--open)
@@ -961,7 +955,7 @@ fi
 ## Step 4: Create DMG ##
 ########################
 
-if [[ "$ARTIFACT" = app && "$CREATE_DMG" = true ]]; then
+if [[ "$ARTIFACT" = app ]]; then
   function create_warp_dmg() {
     echo "Creating $DMG_DIR/$DMG_NAME..."
     rm "$DMG_DIR/$DMG_NAME" || true
@@ -1023,17 +1017,13 @@ if [[ "$ARTIFACT" = app && "$CREATE_DMG" = true ]]; then
 
     create_warp_dmg "$BUNDLE_DIR"
   fi
-elif [[ "$ARTIFACT" = app ]]; then
-  echo "Skipping DMG creation due to --skip-dmg flag."
 fi
 
 ##############################
 ## Step 5: Notarize the app ##
 ##############################
 
-if [[ $CODESIGN = true && "$ARTIFACT" = app && "$CREATE_DMG" != true ]]; then
-  echo "Skipping notarization because --skip-dmg was specified for the app artifact."
-elif [[ $CODESIGN = true ]]; then
+if [[ $CODESIGN = true ]]; then
   echo "Uploading $NOTARIZATION_ARTIFACT to Apple for notarization..."
   notarize_artifact "$NOTARIZATION_ARTIFACT"
 
@@ -1057,12 +1047,9 @@ fi
 #######################################
 
 if [[ "$ARTIFACT" = app ]]; then
-  echo "Copying app to $OUT_DIR"
+  echo "Copying dmg and app to $OUT_DIR"
   cp -R "$BUNDLE_DIR/$WARP_APP_NAME.app" "$OUT_DIR"
-  if [[ "$CREATE_DMG" = true ]]; then
-    echo "Copying dmg to $OUT_DIR"
-    cp "$DMG_DIR/$DMG_NAME" "$OUT_DIR/$FINAL_DMG_NAME"
-  fi
+  cp "$DMG_DIR/$DMG_NAME" "$OUT_DIR/$FINAL_DMG_NAME"
 fi
 
 # If this is being run within a GitHub action, set an output variable with the
