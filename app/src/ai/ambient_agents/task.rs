@@ -15,6 +15,7 @@ use warpui::color::ColorU;
 use warpui::{SingletonEntity, View, ViewContext};
 
 use super::AmbientAgentTaskId;
+use crate::ai::agent::conversation::ConversationStatus;
 use crate::ai::artifacts::{Artifact, deserialize_artifacts};
 use crate::server::server_api::ServerApiProvider;
 use crate::ui_components::icons::Icon;
@@ -463,6 +464,19 @@ impl AmbientAgentTask {
                 + u.platform_cost.unwrap_or(0.0)) as f32
         })
     }
+    /// Total server-reported run cost, in US cents.
+    pub fn cost_in_cents(&self) -> Option<f32> {
+        let usage = self.active_run_execution().request_usage?;
+        let costs = [
+            usage.inference_cost_usd,
+            usage.compute_cost_usd,
+            usage.platform_cost_usd,
+        ];
+        costs
+            .iter()
+            .any(Option::is_some)
+            .then(|| (costs.into_iter().flatten().sum::<f64>() * 100.0) as f32)
+    }
 
     /// Server-reported run duration.
     pub fn run_time(&self) -> Option<ChronoDuration> {
@@ -512,6 +526,29 @@ pub enum AmbientAgentTaskState {
 }
 
 impl AmbientAgentTaskState {
+    /// Maps this run state to the [`ConversationStatus`] shown for a placeholder conversation
+    /// (pill bar, conversation list). Working states collapse to
+    /// [`ConversationStatus::InProgress`] so the badge keeps spinning until the run terminates.
+    pub fn conversation_status(&self) -> ConversationStatus {
+        match self {
+            AmbientAgentTaskState::Queued
+            | AmbientAgentTaskState::Pending
+            | AmbientAgentTaskState::Claimed
+            | AmbientAgentTaskState::InProgress => ConversationStatus::InProgress,
+            AmbientAgentTaskState::Succeeded => ConversationStatus::Success,
+            AmbientAgentTaskState::Failed | AmbientAgentTaskState::Error => {
+                ConversationStatus::Error
+            }
+            AmbientAgentTaskState::Blocked => ConversationStatus::Blocked {
+                blocked_action: String::new(),
+            },
+            AmbientAgentTaskState::Cancelled => ConversationStatus::Cancelled,
+            // `Unknown` is a forward-compat catch-all for server states the client doesn't
+            // recognize yet; the rest of the client treats it as a terminal error.
+            AmbientAgentTaskState::Unknown => ConversationStatus::Error,
+        }
+    }
+
     /// Returns the query param value for the server API.
     pub fn as_query_param(&self) -> Option<&str> {
         match self {
@@ -666,6 +703,9 @@ pub struct RequestUsage {
     pub inference_cost: Option<f64>,
     pub compute_cost: Option<f64>,
     pub platform_cost: Option<f64>,
+    pub inference_cost_usd: Option<f64>,
+    pub compute_cost_usd: Option<f64>,
+    pub platform_cost_usd: Option<f64>,
 }
 
 /// Cancel an ambient agent task and show a toast with the result.

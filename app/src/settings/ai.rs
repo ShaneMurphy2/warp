@@ -659,7 +659,7 @@ pub enum TuiUsageDisplayMode {
     /// Credits spent — the same number the GUI's usage footer shows (default).
     #[default]
     Credits,
-    /// Provider dollar cost.
+    /// Billed dollar cost.
     Cost,
 }
 
@@ -671,7 +671,7 @@ settings::macros::implement_setting_for_enum!(
     surface: settings::SettingSurfaces::TUI,
     private: false,
     toml_path: "agents.usage_display_mode",
-    description: "Which unit the usage entry displays in Warp Agent CLI: credits or provider cost.",
+    description: "Which unit the usage entry displays in Warp Agent CLI: credits or dollars.",
 );
 
 /// Unit for GUI usage and spend displays.
@@ -706,7 +706,6 @@ settings::macros::implement_setting_for_enum!(
     private: false,
     toml_path: "agents.warp_agent.other.usage_display_unit",
     description: "Which unit the GUI's usage/spend displays show: credits or dollars.",
-    feature_flag: FeatureFlag::PricingTransparency,
 );
 
 impl UsageDisplayUnit {
@@ -937,6 +936,9 @@ pub enum PromptSubmissionMode {
     /// (default).
     #[default]
     Interrupt,
+    /// Hold the new prompt until the agent's next request within the current turn (e.g. after
+    /// a tool result), so it lands mid-task without cancelling in-flight work.
+    Steer,
     /// Hold the new prompt until the in-flight response finishes, then submit.
     Queue,
 }
@@ -958,6 +960,7 @@ impl PromptSubmissionMode {
     pub fn display_name(&self) -> &'static str {
         match self {
             PromptSubmissionMode::Interrupt => "Interrupt response",
+            PromptSubmissionMode::Steer => "Steer at next turn",
             PromptSubmissionMode::Queue => "Queue until response finishes",
         }
     }
@@ -965,9 +968,18 @@ impl PromptSubmissionMode {
     pub fn command_palette_description(&self) -> &'static str {
         match self {
             PromptSubmissionMode::Interrupt => "Set default prompt submission: interrupt response",
+            PromptSubmissionMode::Steer => "Set default prompt submission: steer at next turn",
             PromptSubmissionMode::Queue => {
                 "Set default prompt submission: queue until response finishes"
             }
+        }
+    }
+
+    /// Whether this mode can currently be offered to the user.
+    pub fn is_available(&self) -> bool {
+        match self {
+            PromptSubmissionMode::Interrupt | PromptSubmissionMode::Queue => true,
+            PromptSubmissionMode::Steer => FeatureFlag::AgentPromptSteering.is_enabled(),
         }
     }
 }
@@ -975,9 +987,8 @@ impl PromptSubmissionMode {
 /// What happens when a prompt is submitted while an agent controls an agent-requested
 /// long-running command (LRC).
 ///
-/// Only consulted when [`PromptSubmissionMode`] is `Interrupt`: in `Queue` mode
-/// prompts always queue until the full response finishes, so this setting is
-/// hidden and ignored.
+/// Not consulted when [`PromptSubmissionMode`] is `Queue`: prompts then always queue until
+/// the full response finishes, so this setting is hidden and ignored.
 #[derive(
     Default,
     Debug,
@@ -1841,6 +1852,21 @@ define_settings_group!(AISettings, settings: [
         private: true,
     }
 
+    // This is not a user-visible setting - it's merely a one-time flag to track if the
+    // "You're using your ChatGPT plan" modal has been shown for the user's current ChatGPT
+    // connection. Reset when the user disconnects so a later reconnect shows it again.
+    //
+    // We model it as a setting so it's only shown once to a given user regardless of the number of
+    // devices they use.
+    did_show_chatgpt_plan_modal: DidShowChatGPTPlanModal {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::No),
+        surface: settings::SettingSurfaces::GUI,
+        private: true,
+    }
+
     // Used to determine whether the "Latest updates" section of the agent view
     // zero state is expanded or collapsed by default.
     should_expand_oz_updates: ShouldExpandOzUpdates {
@@ -2056,7 +2082,7 @@ define_settings_group!(AISettings, settings: [
     default_prompt_submission_mode: PromptSubmissionMode,
 
     // What happens when a prompt is submitted while an agent controls an agent-requested
-    // long-running command. Only consulted when `default_prompt_submission_mode` is `Interrupt`;
+    // long-running command. Not consulted when `default_prompt_submission_mode` is `Queue`;
     // per-LRC manual overrides live on `QueuedQueryModel`.
     long_running_command_submission_mode: LongRunningCommandSubmissionMode,
 

@@ -1,14 +1,21 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use mockall::predicate::eq;
 use warpui::App;
 
 use super::*;
-use crate::ai::agent::conversation::{AIConversation, ConversationStatus};
+use crate::ai::agent::conversation::{AIConversation, ConversationDriver, ConversationStatus};
+use crate::ai::agent::{
+    AIAgentExchange, AIAgentOutput, AIAgentOutputMessage, AIAgentOutputStatus,
+    FinishedAIAgentOutput, MessageId, ReceivedMessageDisplay, Shared,
+};
 use crate::ai::agent_events::{
     AgentEventConsumerControlFlow, DEFAULT_AGENT_EVENT_RECONNECT_BACKOFF_STEPS,
     agent_event_backoff, agent_event_failures_exceeded_threshold,
 };
+use crate::ai::llms::LLMId;
 use crate::persistence::ModelEvent;
 use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::ai::MockAIClient;
@@ -517,6 +524,7 @@ fn ai_conversation_new_restored_preserves_last_event_sequence() {
         autoexecute_override: None,
         last_event_sequence: Some(42),
         pinned: false,
+        use_warp_credits_instead_of_chatgpt: false,
     };
     let conversation =
         AIConversation::new_restored(AIConversationId::new(), vec![task], Some(data))
@@ -595,7 +603,7 @@ fn make_server_metadata_with_harness(
             context_window_usage: 0.0,
             credits_spent: 0.0,
             platform_credits_spent: 0.0,
-            total_provider_cost_in_cents: None,
+            total_billed_cost_in_cents: None,
             credits_spent_for_last_block: None,
             charged_usage_for_last_block: None,
             total_charged_usage: None,
@@ -3100,6 +3108,129 @@ fn drain_family_events_primary_routes_mixed_batch_and_delivers_inbox() {
 }
 
 #[test]
+fn drain_family_events_primary_does_not_queue_delivery_for_an_external_harness_owner() {
+    // The owner's turns are authored by an external harness (e.g. an ACP agent), so nothing
+    // may be queued for native injection into it; the server wakes such runs itself. Child
+    // tracking, watched-run status fan-out, and the Primary cursor all still advance.
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel::<ModelEvent>(4);
+        let mut global_resource_handles = GlobalResourceHandles::mock(&mut app);
+        global_resource_handles.model_event_sender = Some(sender);
+        app.add_singleton_model(|_| GlobalResourceHandlesProvider::new(global_resource_handles));
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let event_service = app.add_singleton_model(|_| OrchestrationEventService::default());
+
+        let parent_task_id = make_parent_task_id_for_test(0xf6);
+        let parent_run_id = parent_task_id.to_string();
+        let child = make_parent_task_id_for_test(0xf7).to_string();
+
+        let mut conversation = AIConversation::new(false, false);
+        conversation.set_run_id(parent_run_id.clone());
+        conversation.set_driver(ConversationDriver::ExternalHarness);
+        let conversation_id = conversation.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+        });
+
+        let mut mock = MockAIClient::new();
+        mock.expect_update_event_sequence_on_server()
+            .returning(|_, _| Ok(()));
+        // Child discovery kicks off placeholder / tracker metadata fetches in the background;
+        // they are not under test here.
+        mock.expect_get_ambient_agent_task()
+            .returning(|_| Err(anyhow::anyhow!("not under test")));
+        let ai_client: Arc<dyn AIClient> = Arc::new(mock);
+        let server_api = ServerApiProvider::new_for_test().get();
+        let streamer = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+        let watched_statuses = Rc::new(RefCell::new(Vec::new()));
+        app.update(|ctx| {
+            let watched_statuses = Rc::clone(&watched_statuses);
+            ctx.subscribe_to_model(&streamer, move |_, event, _| {
+                if let OrchestrationEventStreamerEvent::WatchedRunStatusChanged {
+                    run_id,
+                    status,
+                    ..
+                } = event
+                {
+                    watched_statuses
+                        .borrow_mut()
+                        .push((run_id.clone(), status.clone()));
+                }
+            });
+        });
+
+        // Non-terminal child lifecycle events only: a terminal one would also evict the child's
+        // cached task through `AgentConversationsModel`, which this fixture does not register.
+        let events = vec![
+            make_seq_event(EVENT_CHILD_AGENT_STARTED, &parent_run_id, Some(&child), 20),
+            make_seq_event("run_in_progress", &child, None, 21),
+            make_seq_event("new_message", &parent_run_id, Some("msg-1"), 22),
+            make_seq_event("run_blocked", &child, None, 23),
+        ];
+        let messages = vec![ReceivedMessageInput {
+            message_id: "msg-1".to_string(),
+            sender_agent_id: child.clone(),
+            addresses: vec![parent_run_id.clone()],
+            subject: "done".to_string(),
+            message_body: "body".to_string(),
+        }];
+
+        streamer.update(&mut app, |me, ctx| {
+            let tracker = OrchestrationChildTracker::new(parent_task_id);
+            let tracker = me.drain_family_events(
+                conversation_id,
+                &parent_run_id,
+                FamilyDrainMode::Primary,
+                tracker,
+                0,
+                events,
+                messages,
+                ctx,
+            );
+            assert!(
+                tracker.is_awaiting_metadata(&child),
+                "child discovery must still route into the tracker"
+            );
+        });
+
+        event_service.read(&app, |service, _| {
+            assert!(
+                !service.has_pending_events(conversation_id),
+                "neither the inbox message nor the child lifecycle may be queued for injection"
+            );
+        });
+        assert_eq!(
+            *watched_statuses.borrow(),
+            vec![
+                (child.clone(), ConversationStatus::InProgress),
+                (
+                    child.clone(),
+                    ConversationStatus::Blocked {
+                        blocked_action: String::new(),
+                    },
+                ),
+            ],
+            "watched-run status updates still reach the pill bar"
+        );
+        history_model.read(&app, |model, _| {
+            assert_eq!(
+                model
+                    .conversation(&conversation_id)
+                    .and_then(|c| c.last_event_sequence()),
+                Some(23),
+                "the Primary cursor must still advance past the dropped events"
+            );
+        });
+    });
+}
+
+#[test]
 fn drain_family_events_observer_advances_cursor_without_server_push() {
     // Observer routes child lifecycle to the tracker and persists the cursor
     // locally, but must never push the server cursor. The mock has no
@@ -3387,5 +3518,111 @@ fn register_parent_on_wait_without_self_run_id_is_noop() {
         poller.read(&app, |me, _| {
             assert!(connected_filter(me, conversation_id).is_none());
         });
+    });
+}
+
+/// A finished exchange whose output echoes `message_id` in a `MessagesReceivedFromAgents` chunk.
+fn exchange_echoing_message(message_id: &str) -> AIAgentExchange {
+    let output = AIAgentOutput {
+        messages: vec![AIAgentOutputMessage::messages_received_from_agents(
+            MessageId::new("output-message".to_string()),
+            vec![ReceivedMessageDisplay {
+                message_id: message_id.to_string(),
+                sender_agent_id: "parent-run".to_string(),
+                addresses: vec!["child-run".to_string()],
+                subject: "subject".to_string(),
+                message_body: "body".to_string(),
+            }],
+        )],
+        ..Default::default()
+    };
+    AIAgentExchange {
+        id: AIAgentExchangeId::new(),
+        input: vec![],
+        output_status: AIAgentOutputStatus::Finished {
+            finished_output: FinishedAIAgentOutput::Success {
+                output: Shared::new(output),
+            },
+        },
+        added_message_ids: Default::default(),
+        start_time: chrono::Local::now(),
+        finish_time: None,
+        time_to_first_token_ms: None,
+        working_directory: None,
+        model_id: LLMId::from("test-model"),
+        request_cost: None,
+        coding_model_id: LLMId::from("test-model"),
+        cli_agent_model_id: LLMId::from("test-model"),
+        computer_use_model_id: LLMId::from("test-model"),
+        response_initiator: None,
+    }
+}
+
+/// Gives `conversation` one exchange that echoes `message_id`, then reports that exchange as
+/// updated `updates` times. The returned receiver sees every resulting delivery confirmation.
+fn report_echoed_message(
+    app: &mut App,
+    mut conversation: AIConversation,
+    message_id: &'static str,
+    updates: usize,
+) -> std::sync::mpsc::Receiver<String> {
+    let history_model =
+        app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+    let exchange = exchange_echoing_message(message_id);
+    let exchange_id = exchange.id;
+    conversation.append_root_exchange_for_test(exchange);
+    let conversation_id = conversation.id();
+    history_model.update(app, |model, ctx| {
+        model.restore_conversations(warpui::EntityId::new(), vec![conversation], ctx);
+    });
+
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    let mut mock = MockAIClient::new();
+    mock.expect_mark_message_delivered().returning(move |id| {
+        sender.send(id.to_string()).unwrap();
+        Ok(())
+    });
+    let ai_client: Arc<dyn AIClient> = Arc::new(mock);
+    let server_api = ServerApiProvider::new_for_test().get();
+    let streamer = app.add_singleton_model(|ctx| {
+        OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+    });
+
+    streamer.update(app, |me, ctx| {
+        for _ in 0..updates {
+            me.on_streaming_exchange_updated(conversation_id, exchange_id, ctx);
+        }
+    });
+    receiver
+}
+
+#[test]
+fn echoed_message_is_confirmed_delivered_once_across_repeated_exchange_updates() {
+    App::test((), |mut app| async move {
+        let receiver =
+            report_echoed_message(&mut app, AIConversation::new(false, false), "message-1", 2);
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Ok("message-1".to_string()),
+            "an echoed message must be confirmed delivered even though this streamer never hydrated it"
+        );
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a second update of the same exchange must not confirm the same id again"
+        );
+    });
+}
+
+#[test]
+fn shared_session_viewer_does_not_confirm_delivery_for_echoed_messages() {
+    App::test((), |mut app| async move {
+        let receiver =
+            report_echoed_message(&mut app, AIConversation::new(true, false), "message-1", 1);
+
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(200)).is_err(),
+            "only the recipient's own process confirms delivery, never a viewer"
+        );
     });
 }

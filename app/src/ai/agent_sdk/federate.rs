@@ -1,6 +1,6 @@
 use std::process;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use serde_json::json;
 use warp_cli::GlobalOptions;
 use warp_cli::agent::OutputFormat;
@@ -11,6 +11,7 @@ use warpui::platform::TerminationMode;
 use warpui::{AppContext, SingletonEntity as _};
 
 use super::common::set_ambient_task_context_from_run_id;
+use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::managed_secrets::AppManagedSecretManager as ManagedSecretManager;
 
 /// Run identity federation commands.
@@ -45,12 +46,14 @@ fn issue_token(
     };
 
     ManagedSecretManager::handle(ctx).update(ctx, move |manager, ctx| {
-        let future =
-            manager.issue_task_identity_token(warp_managed_secrets::client::IdentityTokenOptions {
+        let future = manager.issue_task_identity_token(
+            None,
+            warp_managed_secrets::client::IdentityTokenOptions {
                 audience,
                 requested_duration: duration,
                 subject_template,
-            });
+            },
+        );
         ctx.spawn(future, move |_, result, ctx| match result {
             Ok(token) => {
                 let token_value = token.token;
@@ -87,8 +90,17 @@ fn issue_token(
     Ok(())
 }
 fn issue_gcp_token(ctx: &mut AppContext, args: IssueGcpTokenArgs) -> Result<()> {
-    // Set the task ID so the ambient agent workload token header is sent.
-    set_ambient_task_context_from_run_id(ctx, &args.run_id)?;
+    if let Some(run_id) = &args.run_id {
+        set_ambient_task_context_from_run_id(ctx, run_id)?;
+    } else {
+        let sandbox_id = std::env::var(warp_cli::WARP_PREWARMED_SANDBOX_ID_ENV)
+            .ok()
+            .filter(|id| !id.is_empty())
+            .context("GCP federation requires a run ID or pre-warmed sandbox ID")?;
+        ServerApiProvider::as_ref(ctx)
+            .get()
+            .set_prewarmed_sandbox_id(sandbox_id);
+    }
 
     let duration: std::time::Duration = args.duration.into();
     let audience = args.audience;

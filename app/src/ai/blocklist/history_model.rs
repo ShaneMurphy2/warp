@@ -28,8 +28,8 @@ use super::persistence::{PersistedAIInput, PersistedAIInputType};
 use crate::GlobalResourceHandlesProvider;
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{
-    AIConversation, AIConversationId, ConversationStatus, ServerAIConversationMetadata, TodoStatus,
-    UpdateConversationError,
+    AIConversation, AIConversationId, ConversationDriver, ConversationStatus,
+    ServerAIConversationMetadata, TodoStatus, UpdateConversationError,
 };
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::task::helper::{MessageExt, ToolCallExt};
@@ -39,6 +39,7 @@ use crate::ai::agent::{
     AIAgentTodoId, CancellationReason, FinishedAIAgentOutput, MessageId, RenderableAIError,
     RequestCost, Suggestions,
 };
+use crate::ai::ambient_agents::AmbientAgentTask;
 use crate::ai::artifacts::Artifact;
 use crate::ai::document::ai_document_model::AIDocumentModel;
 use crate::input_suggestions::HistoryOrder;
@@ -649,6 +650,26 @@ impl BlocklistAIHistoryModel {
         conversation_id
     }
 
+    /// Applies a remote child's server task snapshot to its placeholder conversation: the run's
+    /// update time (pill ordering) and its state (pill status badge).
+    pub fn apply_remote_child_task_snapshot(
+        &mut self,
+        terminal_surface_id: EntityId,
+        conversation_id: AIConversationId,
+        task: &AmbientAgentTask,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) {
+            conversation.set_remote_run_updated_at(task.updated_at.with_timezone(&Local));
+        }
+        self.update_conversation_status(
+            terminal_surface_id,
+            conversation_id,
+            task.state.conversation_status(),
+            ctx,
+        );
+    }
+
     /// Sets the parent conversation ID on a child conversation and updates
     /// the `children_by_parent` index.  All parent-child relationships should
     /// be established through this method so the index stays in sync.
@@ -918,6 +939,31 @@ impl BlocklistAIHistoryModel {
             return;
         }
         conversation.set_pinned(pinned);
+        conversation.write_updated_conversation_state(ctx);
+        ctx.emit(BlocklistAIHistoryEvent::UpdatedConversationMetadata {
+            terminal_surface_id: self.terminal_surface_id_for_conversation(&conversation_id),
+            conversation_id,
+        });
+    }
+
+    /// Switches the rest of a conversation to Warp-funded inference instead of the user's
+    /// ChatGPT subscription and persists the change to SQLite.
+    pub fn set_conversation_use_warp_credits_instead_of_chatgpt(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) else {
+            log::warn!(
+                "set_conversation_use_warp_credits_instead_of_chatgpt called for conversation \
+                 {conversation_id:?} that is not loaded; the change will not be persisted."
+            );
+            return;
+        };
+        if conversation.use_warp_credits_instead_of_chatgpt() {
+            return;
+        }
+        conversation.set_use_warp_credits_instead_of_chatgpt();
         conversation.write_updated_conversation_state(ctx);
         ctx.emit(BlocklistAIHistoryEvent::UpdatedConversationMetadata {
             terminal_surface_id: self.terminal_surface_id_for_conversation(&conversation_id),
@@ -1792,6 +1838,8 @@ impl BlocklistAIHistoryModel {
             autoexecute_override: Some(source_conversation.autoexecute_override().into()),
             last_event_sequence: None,
             pinned: false,
+            use_warp_credits_instead_of_chatgpt: source_conversation
+                .use_warp_credits_instead_of_chatgpt(),
         };
         let forked_conversation_id = AIConversationId::new();
         if let Err(e) = sqlite_sender.send(ModelEvent::UpdateMultiAgentConversation {
@@ -1970,6 +2018,7 @@ impl BlocklistAIHistoryModel {
             autoexecute_override: Some(conversation.autoexecute_override().into()),
             last_event_sequence: None,
             pinned: false,
+            use_warp_credits_instead_of_chatgpt: conversation.use_warp_credits_instead_of_chatgpt(),
         };
 
         let forked_conversation_id = AIConversationId::new();
@@ -2628,6 +2677,16 @@ impl BlocklistAIHistoryModel {
         }
     }
 
+    pub fn set_driver_for_conversation(
+        &mut self,
+        conversation_id: AIConversationId,
+        driver: ConversationDriver,
+    ) {
+        if let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) {
+            conversation.set_driver(driver);
+        }
+    }
+
     pub fn set_has_code_review_opened_to_true(&mut self, conversation_id: AIConversationId) {
         if let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) {
             conversation.mark_code_review_as_opened();
@@ -2945,6 +3004,9 @@ impl BlocklistAIHistoryModel {
             Some(merged_conversation_data),
         )?;
         merged.reassign_exchange_ids();
+        if let Some(updated_at) = placeholder.remote_run_updated_at() {
+            merged.set_remote_run_updated_at(updated_at);
+        }
 
         if let Some(metadata) = cloud_conversation.server_metadata() {
             merged.set_server_metadata(metadata.clone());
@@ -3003,7 +3065,7 @@ impl BlocklistAIHistoryModel {
 ///
 /// **Reset on merge** (rebuild-from-cloud invariants):
 /// - `reverted_action_ids = None`, `root_task_is_optimistic = None`,
-///   `autoexecute_override = None`
+///   `autoexecute_override = None`, `use_warp_credits_instead_of_chatgpt = false`
 fn merged_remote_child_placeholder_conversation_data(
     placeholder: &AIConversation,
     cloud_conversation: &AIConversation,
@@ -3054,6 +3116,7 @@ fn merged_remote_child_placeholder_conversation_data(
         reverted_action_ids: None,
         root_task_is_optimistic: None,
         autoexecute_override: None,
+        use_warp_credits_instead_of_chatgpt: false,
     }
 }
 

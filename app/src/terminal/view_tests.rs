@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::pin;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -90,6 +90,7 @@ use crate::terminal::view::shared_session::ConversationEndedTombstoneView;
 use crate::terminal::{
     CLIAgent, MockTerminalManager, TerminalManager, TerminalModel, should_right_click_paste,
 };
+use crate::test_util::billing_unit::set_charge_unit;
 use crate::test_util::terminal::{
     add_window_with_id_and_terminal, initialize_app_for_terminal_view,
 };
@@ -98,6 +99,7 @@ use crate::view_components::find::FindWithinBlockState;
 use crate::workspace::view::tests::{initialize_app as initialize_workspace_app, mock_workspace};
 use crate::workspace::{ToastStack, WorkspaceAction};
 use crate::workspaces::user_workspaces::TeamlessScopeForTest;
+use crate::workspaces::workspace::ChargeUnit;
 
 fn add_window_with_cloud_mode_terminal(app: &mut App) -> ViewHandle<TerminalView> {
     let tips_model = app.add_model(|_| Default::default());
@@ -2096,6 +2098,53 @@ fn is_passive_conversation_is_false_for_a_directly_issued_user_query() {
 }
 
 #[test]
+fn turn_panel_does_not_insert_a_block_after_its_footer() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        set_charge_unit(&mut app, ChargeUnit::Cents);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let ai_block = terminal.update(&mut app, |view, ctx| {
+            view.insert_dummy_ai_block("query".to_string(), "response".to_string(), ctx)
+        });
+
+        let initial_content_ids = terminal.read(&app, |view, _| {
+            view.rich_content_views
+                .iter()
+                .map(|content| content.view_id())
+                .collect::<Vec<_>>()
+        });
+
+        ai_block.update(&mut app, |block, ctx| {
+            block.handle_action(&AIBlockAction::ToggleIsTurnPanelExpanded, ctx);
+        });
+        terminal.read(&app, |view, _| {
+            assert!(view.turn_panel_view_ids.contains_key(&ai_block.id()));
+            assert_eq!(
+                view.rich_content_views
+                    .iter()
+                    .map(|content| content.view_id())
+                    .collect::<Vec<_>>(),
+                initial_content_ids
+            );
+        });
+
+        ai_block.update(&mut app, |block, ctx| {
+            block.handle_action(&AIBlockAction::ToggleIsTurnPanelExpanded, ctx);
+        });
+        terminal.read(&app, |view, _| {
+            assert!(!view.turn_panel_view_ids.contains_key(&ai_block.id()));
+            assert_eq!(
+                view.rich_content_views
+                    .iter()
+                    .map(|content| content.view_id())
+                    .collect::<Vec<_>>(),
+                initial_content_ids
+            );
+        });
+    })
+}
+
+#[test]
 fn is_passive_conversation_is_recomputed_on_conversation_reassignment() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
@@ -3802,6 +3851,7 @@ fn cloud_mode_dispatched_agent_inserts_queued_user_query() {
                 .update(ctx, |model, ctx| {
                     model.spawn_agent_with_request(
                         SpawnAgentRequest {
+                            metadata: Default::default(),
                             prompt: Some("write the tests".to_string()),
                             mode: UserQueryMode::Normal,
                             config: None,
@@ -7602,9 +7652,10 @@ fn shared_session_cancel_action_interrupts_running_agent_command() {
             start_conversation_with_running_agent_command(view, &server_conversation_token, ctx)
         });
 
-        terminal.update(&mut app, |view, ctx| {
-            view.handle_shared_session_cancel_action(server_conversation_token, ctx);
+        let cancelled = terminal.update(&mut app, |view, ctx| {
+            view.handle_shared_session_cancel_action(server_conversation_token, ctx)
         });
+        assert!(cancelled);
 
         assert_eq!(*pty_writes.borrow(), vec![vec![C0::ETX]]);
         terminal.read(&app, |_, ctx| {
@@ -7673,6 +7724,93 @@ fn shared_session_cancel_action_releases_agent_controlled_command_before_interru
     })
 }
 
+/// Binds the pane's AI controller to a harness-driven conversation with a turn in progress and
+/// installs the cancel sink, returning the conversation and the sink's receiver.
+fn start_harness_driven_conversation(
+    view: &mut TerminalView,
+    ctx: &mut ViewContext<TerminalView>,
+) -> (
+    AIConversationId,
+    async_channel::Receiver<crate::ai::blocklist::ExternalHarnessCancel>,
+) {
+    view.model
+        .lock()
+        .simulate_long_running_block("pi --acp", "running");
+    view.ai_controller.update(ctx, |controller, ctx| {
+        let conversation_id = controller.bind_native_prompt_conversation(None, ctx);
+        controller
+            .begin_external_harness_turn(conversation_id, Some("run-1".into()), ctx)
+            .unwrap();
+        let (sink, cancels) = async_channel::unbounded();
+        controller.set_external_harness_cancel_sink(sink);
+        (conversation_id, cancels)
+    })
+}
+
+#[test]
+fn stopping_a_harness_driven_conversation_goes_to_the_harness_not_the_pty() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        FeatureFlag::AgentView.set_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let pty_writes = capture_pty_writes(&mut app, &terminal);
+        let (conversation_id, cancels) =
+            terminal.update(&mut app, start_harness_driven_conversation);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.stop_local_agent_conversation(conversation_id, ctx);
+        });
+
+        assert!(cancels.try_recv().is_ok());
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "a Ctrl-C would kill the agent instead of interrupting its turn"
+        );
+        terminal.read(&app, |_, ctx| {
+            let conversation = BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation(&conversation_id)
+                .expect("conversation should exist");
+            assert_eq!(
+                conversation.status(),
+                &ConversationStatus::InProgress,
+                "the harness settles the status once its agent answers the cancel"
+            );
+        });
+    })
+}
+
+#[test]
+fn stopping_a_harness_driven_conversation_falls_back_once_the_harness_stopped() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        FeatureFlag::AgentView.set_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let pty_writes = capture_pty_writes(&mut app, &terminal);
+        let (conversation_id, cancels) =
+            terminal.update(&mut app, start_harness_driven_conversation);
+        // The turn driver owns the receiver; it is gone once the driver's run ended.
+        drop(cancels);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.stop_local_agent_conversation(conversation_id, ctx);
+        });
+
+        assert_eq!(
+            *pty_writes.borrow(),
+            vec![vec![C0::ETX]],
+            "with nobody to take the cancel, the block is interrupted as for a native stop"
+        );
+        terminal.read(&app, |_, ctx| {
+            let conversation = BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation(&conversation_id)
+                .expect("conversation should exist");
+            assert_eq!(conversation.status(), &ConversationStatus::Cancelled);
+        });
+    })
+}
+
 #[test]
 fn shared_session_cancel_action_ignores_unknown_and_finished_conversations() {
     App::test((), |mut app| async move {
@@ -7688,17 +7826,18 @@ fn shared_session_cancel_action_ignores_unknown_and_finished_conversations() {
         });
 
         // A token that isn't bound to any conversation on this surface is a no-op.
-        terminal.update(&mut app, |view, ctx| {
+        let cancelled = terminal.update(&mut app, |view, ctx| {
             view.handle_shared_session_cancel_action(
                 SessionSharingServerConversationToken::new(),
                 ctx,
-            );
+            )
         });
+        assert!(!cancelled);
         assert!(pty_writes.borrow().is_empty());
 
         // A cancel that arrives after the conversation already finished must neither interrupt
         // the command nor overwrite the terminal status.
-        terminal.update(&mut app, |view, ctx| {
+        let cancelled = terminal.update(&mut app, |view, ctx| {
             BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
                 history.update_conversation_status(
                     view.view_id,
@@ -7707,8 +7846,9 @@ fn shared_session_cancel_action_ignores_unknown_and_finished_conversations() {
                     ctx,
                 );
             });
-            view.handle_shared_session_cancel_action(server_conversation_token, ctx);
+            view.handle_shared_session_cancel_action(server_conversation_token, ctx)
         });
+        assert!(!cancelled);
         assert!(pty_writes.borrow().is_empty());
         terminal.read(&app, |_, ctx| {
             let conversation = BlocklistAIHistoryModel::as_ref(ctx)
@@ -8564,6 +8704,34 @@ fn submit_cli_agent_rich_input_opencode_defers_enter_and_close() {
             "carriage return should be written after delay"
         );
         assert_eq!(pty_writes.borrow()[1], b"\r");
+    })
+}
+
+#[test]
+fn submit_cli_agent_rich_input_muse_uses_bracketed_paste() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+
+        let (_terminal, pty_writes) =
+            submit_rich_input_and_collect_pty_writes(&mut app, CLIAgent::Muse, "hello");
+
+        let writes = pty_writes.borrow();
+        assert_eq!(
+            writes.len(),
+            2,
+            "expected 2 PTY writes, got {}",
+            writes.len()
+        );
+
+        let mut expected_paste =
+            Vec::with_capacity(BRACKETED_PASTE_START.len() + 5 + BRACKETED_PASTE_END.len());
+        expected_paste.extend_from_slice(BRACKETED_PASTE_START);
+        expected_paste.extend_from_slice(b"hello");
+        expected_paste.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(writes[0], expected_paste);
+        assert_eq!(writes[1], b"\r");
     })
 }
 

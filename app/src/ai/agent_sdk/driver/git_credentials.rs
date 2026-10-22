@@ -2,9 +2,8 @@
 ///
 /// This module handles:
 /// - Writing provider credentials to `~/.git-credentials`, GitHub credentials
-///   to `~/.config/gh/hosts.yml`, and refresh-safe Azure CLI authentication.
-/// - One-time git configuration (`credential.helper store`, SSH→HTTPS URL
-///   rewrites).
+///   to the `gh` config directory, and refresh-safe Azure CLI authentication.
+/// - One-time git configuration (read-only credentials, SSH→HTTPS URL rewrites).
 /// - Configuring the git user identity from the server-returned username/email.
 /// - An async refresh loop that periodically fetches a fresh token from the
 ///   server and overwrites the credential files, keeping long-running agents
@@ -45,6 +44,8 @@ const GIT_CREDENTIALS_REFRESH_BACKOFF: [Duration; 3] = [
 
 const DEFAULT_GIT_NAME: &str = "Warp";
 const DEFAULT_GIT_EMAIL: &str = "agent@warp.dev";
+const READ_ONLY_CREDENTIAL_HELPER: &str =
+    r#"!f() { test "$1" = get && exec git credential-store get; }; f"#;
 const GITHUB_HOST: &str = "github.com";
 const GH_HOSTS_FILENAME: &str = "hosts.yml";
 const GLAB_HOST: &str = "gitlab.com";
@@ -87,7 +88,33 @@ pub(crate) fn ensure_workload_token_available() -> Result<(), TaskGitCredentials
 }
 
 fn home_dir() -> Result<PathBuf> {
-    dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
+    let home = if cfg!(windows) {
+        git_home_dir(|key| std::env::var_os(key))
+    } else {
+        None
+    };
+    home.or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))
+}
+
+/// Resolves `~` the way git does on Windows: from the environment, not from the profile of the
+/// account the process runs as. The credential files must land where git's `store` helper reads
+/// them, and `dirs::home_dir` disagrees with git when a process running as SYSTEM carries another
+/// user's `USERPROFILE`.
+fn git_home_dir(get_env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let non_empty = |key: &str| get_env(key).filter(|value| !value.is_empty());
+    if let Some(home) = non_empty("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    if let (Some(drive), Some(path)) = (non_empty("HOMEDRIVE"), non_empty("HOMEPATH")) {
+        let mut combined = drive;
+        combined.push(path);
+        let combined = PathBuf::from(combined);
+        if combined.is_dir() {
+            return Some(combined);
+        }
+    }
+    non_empty("USERPROFILE").map(PathBuf::from)
 }
 
 /// Write `content` to `path` using owner-only (0600) permissions.
@@ -393,7 +420,35 @@ fn write_git_credentials_file(credentials: &[GitCredential]) -> Result<()> {
     Ok(())
 }
 
-/// Write `~/.config/gh/hosts.yml` so the `gh` CLI is authenticated.
+/// The directory `gh` reads its config from, in `gh`'s own precedence order. On Windows `gh`
+/// ignores `~/.config/gh` whenever `APPDATA` is set.
+fn gh_config_dir(home: &Path) -> PathBuf {
+    resolve_gh_config_dir(home, cfg!(windows), |key| std::env::var_os(key))
+}
+
+fn resolve_gh_config_dir(
+    home: &Path,
+    is_windows: bool,
+    get_env: impl Fn(&str) -> Option<OsString>,
+) -> PathBuf {
+    let non_empty = |key: &str| {
+        get_env(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    if let Some(dir) = non_empty("GH_CONFIG_DIR") {
+        return dir;
+    }
+    if let Some(dir) = non_empty("XDG_CONFIG_HOME") {
+        return dir.join("gh");
+    }
+    if is_windows && let Some(app_data) = non_empty("APPDATA") {
+        return app_data.join("GitHub CLI");
+    }
+    home.join(".config").join("gh")
+}
+
+/// Write `hosts.yml` into `gh_config_dir` so the `gh` CLI is authenticated.
 ///
 /// The YAML format is stable for `gh` v2+:
 /// ```yaml
@@ -404,7 +459,7 @@ fn write_git_credentials_file(credentials: &[GitCredential]) -> Result<()> {
 /// ```
 ///
 /// The write is atomic: a temporary file is written then renamed.
-fn write_gh_hosts_yml(credentials: &[GitCredential], home: &std::path::Path) -> Result<()> {
+fn write_gh_hosts_yml(credentials: &[GitCredential], gh_config_dir: &Path) -> Result<()> {
     let github_credentials = credentials
         .iter()
         .filter(|credential| credential.host == GITHUB_HOST)
@@ -412,8 +467,7 @@ fn write_gh_hosts_yml(credentials: &[GitCredential], home: &std::path::Path) -> 
     if github_credentials.is_empty() {
         return Ok(());
     }
-    let gh_config_dir = home.join(".config").join("gh");
-    std::fs::create_dir_all(&gh_config_dir)
+    std::fs::create_dir_all(gh_config_dir)
         .with_context(|| format!("Failed to create {}", gh_config_dir.display()))?;
     let path = gh_config_dir.join(GH_HOSTS_FILENAME);
     let tmp_path = gh_config_dir.join(format!("{GH_HOSTS_FILENAME}.tmp"));
@@ -533,7 +587,7 @@ pub(crate) fn write_git_credentials_with_failures(
     let home = home_dir()?;
     let outcomes = [
         write_git_credentials_file(credentials),
-        write_gh_hosts_yml(credentials, &home),
+        write_gh_hosts_yml(credentials, &gh_config_dir(&home)),
         write_glab_config(credentials, &home),
         write_azure_cli_auth(credentials, &home),
     ];
@@ -562,6 +616,53 @@ pub(crate) fn configure_git_credentials(credentials: &[GitCredential]) -> Result
     }
     setup_git_config(&credentials);
     configure_git_identity(&credentials);
+    record_host_identities(&credentials);
+    write_git_credentials(&credentials)
+}
+
+/// Clears git and GitHub CLI authentication before a standby sandbox changes principals.
+pub(crate) fn clear_standby_credentials() -> Result<()> {
+    let home = home_dir()?;
+    for path in [
+        home.join(".git-credentials"),
+        gh_config_dir(&home).join(GH_HOSTS_FILENAME),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to remove standby credentials at {}", path.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Installs run credentials without overwriting setup-customized author identities.
+pub(crate) fn configure_assignment_git_credentials(
+    credentials: &[GitCredential],
+    repositories: &[(PathBuf, &str)],
+) -> Result<()> {
+    let credentials = unique_credentials_by_host(credentials)?;
+    let managed_repositories = repositories
+        .iter()
+        .filter(|(path, host)| repository_git_identity(path) == recorded_identity_for_host(host))
+        .collect::<Vec<_>>();
+    if global_git_identity() == recorded_identity_for_host(GITHUB_HOST) {
+        configure_git_identity(&credentials);
+    }
+    for (path, host) in managed_repositories {
+        let credential = credentials
+            .iter()
+            .find(|credential| credential.host == *host)
+            .or_else(|| credentials.first());
+        let (name, email) = identity_of(credential);
+        run_repository_git_config(path, "user.name", &name);
+        run_repository_git_config(path, "user.email", &email);
+    }
+    setup_git_config(&credentials);
     record_host_identities(&credentials);
     write_git_credentials(&credentials)
 }
@@ -608,13 +709,14 @@ fn run_git_config_add(key: &str, value: &str) {
 
 /// Run one-time git configuration that is set at startup and never needs to
 /// be refreshed:
-/// - `credential.helper store` so git reads `~/.git-credentials`
+/// - Read-only access to `~/.git-credentials` so one authentication failure cannot erase a host's
+///   shared credential.
 /// - SSH→HTTPS URL rewrites for each credential host, covering both the
 ///   scp-style (`git@{host}:`) and explicit-protocol (`ssh://git@{host}/`)
 ///   URL forms, so operations on either form use HTTPS credentials instead
 ///   of looking for an SSH key.
 pub(crate) fn setup_git_config(credentials: &[GitCredential]) {
-    run_git_config("credential.helper", "store");
+    run_git_config("credential.helper", READ_ONLY_CREDENTIAL_HELPER);
     // Use --add for both forms per host so all values coexist as a
     // multi-value key rather than each entry overwriting the previous one.
     for cred in credentials {
@@ -858,6 +960,7 @@ fn apply_refreshed_credentials(response: TaskGitCredentialsResponse) -> Result<b
 async fn try_refresh(
     task_id: &str,
     ai_client: &Arc<dyn AIClient>,
+    use_factory_repositories: bool,
 ) -> Result<(), TaskGitCredentialsError> {
     ensure_workload_token_available()?;
     let workload_token =
@@ -867,7 +970,12 @@ async fn try_refresh(
             .token;
 
     let response = ai_client
-        .get_task_git_credentials(task_id.to_string(), workload_token, true)
+        .get_task_git_credentials(
+            task_id.to_string(),
+            workload_token,
+            true,
+            use_factory_repositories,
+        )
         .await?;
 
     if apply_refreshed_credentials(response).map_err(TaskGitCredentialsError::Request)? {
@@ -885,8 +993,8 @@ async fn try_refresh(
 /// On each iteration:
 /// 1. Issue a short-lived workload token.
 /// 2. Call `taskGitCredentials` to get a fresh token from the server.
-/// 3. Overwrite `~/.git-credentials` and refresh GitHub credentials in
-///    `~/.config/gh/hosts.yml`.
+/// 3. Overwrite `~/.git-credentials` and refresh GitHub credentials in the
+///    `gh` `hosts.yml`.
 ///
 /// On transient failure, the refresh is retried up to three times with
 /// exponential backoff (1 min, 2 min, 4 min), keeping all retries within the
@@ -897,7 +1005,11 @@ async fn try_refresh(
 /// This future never resolves — it is designed to be raced with the harness
 /// execution future via `futures::select!` and dropped when the harness
 /// completes.
-pub(crate) async fn refresh_loop(task_id: String, ai_client: Arc<dyn AIClient>) {
+pub(crate) async fn refresh_loop(
+    task_id: String,
+    ai_client: Arc<dyn AIClient>,
+    use_factory_repositories: bool,
+) {
     loop {
         warpui::r#async::Timer::after(GIT_CREDENTIALS_REFRESH_INTERVAL).await;
 
@@ -905,7 +1017,7 @@ pub(crate) async fn refresh_loop(task_id: String, ai_client: Arc<dyn AIClient>) 
 
         if with_retry(
             "Git credentials refresh",
-            || try_refresh(&task_id, &ai_client),
+            || try_refresh(&task_id, &ai_client, use_factory_repositories),
             is_retryable,
             |delay| async move {
                 warpui::r#async::Timer::after(delay).await;

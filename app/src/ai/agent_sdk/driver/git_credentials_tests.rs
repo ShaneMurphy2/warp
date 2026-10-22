@@ -1,3 +1,6 @@
+use std::io::Write as _;
+use std::process::Stdio;
+
 use warp_graphql::ai::PlatformErrorCode;
 use warp_graphql::error::{
     PlatformError as GraphqlPlatformError, UserFacingError, UserFacingErrorInterface,
@@ -9,7 +12,262 @@ use warp_graphql::platform_error::{
 use warp_graphql::response_context::ResponseContext;
 
 use super::*;
-use crate::server::server_api::ai::TaskGitCredentialsResponse;
+use crate::server::server_api::ai::{MockAIClient, TaskGitCredentialsResponse};
+fn with_assignment_git_home(test_name: &str, test: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    if let Some(home) = std::env::var_os("WARP_TEST_ASSIGNMENT_GIT_HOME") {
+        return test(Path::new(&home));
+    }
+    let home = tempfile::tempdir()?;
+    let mut command = BlockingCommand::new(std::env::current_exe()?);
+    #[cfg(windows)]
+    command.creation_flags(0);
+    let output = command
+        .args([
+            "--exact",
+            &format!("ai::agent_sdk::driver::git_credentials::tests::{test_name}"),
+            "--nocapture",
+        ])
+        .current_dir(home.path())
+        .env("WARP_TEST_ASSIGNMENT_GIT_HOME", home.path())
+        .env("HOME", home.path())
+        .env("GH_CONFIG_DIR", home.path().join("gh"))
+        .env("GIT_CONFIG_GLOBAL", home.path().join(".gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn assignment_without_github_removes_standby_authentication() -> Result<()> {
+    with_assignment_git_home(
+        "assignment_without_github_removes_standby_authentication",
+        |home| {
+            configure_git_credentials(&[github_credential()])?;
+
+            clear_standby_credentials()?;
+            configure_assignment_git_credentials(&[gitlab_credential()], &[])?;
+
+            assert_eq!(
+                std::fs::read_to_string(home.join(".git-credentials"))?,
+                "https://oauth2:gitlab-token@gitlab.com\n"
+            );
+            assert!(!gh_config_dir(home).join(GH_HOSTS_FILENAME).exists());
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn assignment_without_credentials_removes_standby_authentication() -> Result<()> {
+    with_assignment_git_home(
+        "assignment_without_credentials_removes_standby_authentication",
+        |home| {
+            configure_git_credentials(&[github_credential()])?;
+
+            clear_standby_credentials()?;
+            configure_assignment_git_credentials(&[], &[])?;
+
+            assert!(!home.join(".git-credentials").exists());
+            assert!(!gh_config_dir(home).join(GH_HOSTS_FILENAME).exists());
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn assignment_replaces_standby_author_and_credentials() -> Result<()> {
+    with_assignment_git_home(
+        "assignment_replaces_standby_author_and_credentials",
+        |home| {
+            init_repo(home);
+            configure_git_credentials(&[github_credential()])?;
+            configure_repository_git_identity_if_unset(home, GITHUB_HOST, global_git_identity());
+            let creator = GitCredential {
+                token: "creator-token".into(),
+                username: Some("creator".into()),
+                email: Some("creator@example.com".into()),
+                host: GITHUB_HOST.into(),
+            };
+
+            clear_standby_credentials()?;
+            configure_assignment_git_credentials(&[creator], &[(home.into(), GITHUB_HOST)])?;
+
+            assert_eq!(
+                repository_git_identity(home),
+                Some(("creator".into(), "creator@example.com".into()))
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join(".git-credentials"))?,
+                "https://creator:creator-token@github.com\n"
+            );
+            let hosts = std::fs::read_to_string(gh_config_dir(home).join(GH_HOSTS_FILENAME))?;
+            assert!(hosts.contains("creator-token"));
+            assert!(!hosts.contains("github-token"));
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn assignment_preserves_setup_authors() -> Result<()> {
+    with_assignment_git_home("assignment_preserves_setup_authors", |home| {
+        init_repo(home);
+        configure_git_credentials(&[github_credential()])?;
+        run_git_config("user.name", "Setup Global");
+        run_git_config("user.email", "global@example.com");
+        run_repository_git_config(home, "user.name", "Setup Local");
+        run_repository_git_config(home, "user.email", "local@example.com");
+        let creator = GitCredential {
+            token: "creator-token".into(),
+            username: Some("creator".into()),
+            email: Some("creator@example.com".into()),
+            host: GITHUB_HOST.into(),
+        };
+
+        clear_standby_credentials()?;
+        configure_assignment_git_credentials(&[creator], &[(home.into(), GITHUB_HOST)])?;
+
+        assert_eq!(
+            global_git_identity(),
+            Some(("Setup Global".into(), "global@example.com".into()))
+        );
+        assert_eq!(
+            repository_git_identity(home),
+            Some(("Setup Local".into(), "local@example.com".into()))
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn git_authentication_preserves_managed_credentials() -> Result<()> {
+    let Some(home) = std::env::var_os("WARP_TEST_MANAGED_CREDENTIALS_HOME") else {
+        let home = tempfile::tempdir()?;
+        let mut command = BlockingCommand::new(std::env::current_exe()?);
+        #[cfg(windows)]
+        command.creation_flags(0);
+        let output = command
+            .args([
+                "--exact",
+                "ai::agent_sdk::driver::git_credentials::tests::git_authentication_preserves_managed_credentials",
+                "--nocapture",
+            ])
+            .current_dir(home.path())
+            .env("WARP_TEST_MANAGED_CREDENTIALS_HOME", home.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("GIT_CONFIG_GLOBAL", home.path().join(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    };
+
+    let path = PathBuf::from(home).join(".git-credentials");
+    let credentials = "https://oauth2:gitlab-token@gitlab.com\n";
+    std::fs::write(&path, credentials)?;
+    setup_git_config(&[]);
+
+    let credential_command = |operation: &str, input: &str| -> Result<String> {
+        let mut child = BlockingCommand::new("git")
+            .args(["credential", operation])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(input.as_bytes())?;
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+
+    credential_command(
+        "reject",
+        "protocol=https\nhost=gitlab.com\nusername=oauth2\npassword=gitlab-token\n\n",
+    )?;
+    let filled = credential_command("fill", "protocol=https\nhost=gitlab.com\n\n")?;
+    assert!(filled.lines().any(|line| line == "username=oauth2"));
+    assert!(filled.lines().any(|line| line == "password=gitlab-token"));
+
+    credential_command(
+        "approve",
+        "protocol=https\nhost=gitlab.com\nusername=oauth2\npassword=other-token\n\n",
+    )?;
+    assert_eq!(std::fs::read_to_string(path)?, credentials);
+    Ok(())
+}
+
+#[test]
+fn refresh_keeps_the_captured_repository_scope() {
+    let output = BlockingCommand::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "ai::agent_sdk::driver::git_credentials::tests::retained_scope_refresh_subprocess",
+            "--nocapture",
+        ])
+        .env("WARP_TEST_RETAINED_SCOPE_REFRESH", "1")
+        .env("WARP_ISOLATION_PLATFORM", "docker")
+        .env("WARP_WORKLOAD_TOKEN", "test-workload-token")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn retained_scope_refresh_subprocess() {
+    if std::env::var_os("WARP_TEST_RETAINED_SCOPE_REFRESH").is_none() {
+        return;
+    }
+    for captured_scope in [false, true] {
+        let _flag = warp_core::features::FeatureFlag::FactoryDeferredRepositories
+            .override_enabled(!captured_scope);
+        let mut ai_client = MockAIClient::new();
+        ai_client
+            .expect_get_task_git_credentials()
+            .times(1)
+            .withf(move |task_id, _, partial, factory_scope| {
+                task_id == "task-one" && *partial && *factory_scope == captured_scope
+            })
+            .returning(|_, _, _, _| {
+                Ok(TaskGitCredentialsResponse {
+                    credentials: Vec::new(),
+                    failed_hosts: Vec::new(),
+                })
+            });
+        let ai_client: Arc<dyn AIClient> = Arc::new(ai_client);
+        futures::executor::block_on(try_refresh("task-one", &ai_client, captured_scope)).unwrap();
+    }
+}
 
 #[test]
 fn from_user_facing_converts_platform_error_preserving_metadata_and_debug() {
@@ -158,7 +416,7 @@ fn write_gh_hosts_yml_uses_gh_cli_filename() -> Result<()> {
             email: Some("octocat@example.com".to_string()),
             host: "github.com".to_string(),
         }],
-        temp_dir.path(),
+        &gh_config_dir,
     )?;
 
     let hosts_path = gh_config_dir.join(GH_HOSTS_FILENAME);
@@ -198,7 +456,7 @@ fn write_gh_hosts_yml_excludes_gitlab_credentials() -> Result<()> {
                 host: "gitlab.com".to_string(),
             },
         ],
-        temp_dir.path(),
+        &gh_config_dir,
     )?;
 
     let hosts = std::fs::read_to_string(gh_config_dir.join(GH_HOSTS_FILENAME))?;
@@ -212,6 +470,7 @@ fn write_gh_hosts_yml_excludes_gitlab_credentials() -> Result<()> {
 #[test]
 fn write_gh_hosts_yml_skips_gitlab_only_credentials() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
+    let gh_config_dir = temp_dir.path().join(".config").join("gh");
 
     write_gh_hosts_yml(
         &[GitCredential {
@@ -220,12 +479,78 @@ fn write_gh_hosts_yml_skips_gitlab_only_credentials() -> Result<()> {
             email: None,
             host: "gitlab.com".to_string(),
         }],
-        temp_dir.path(),
+        &gh_config_dir,
     )?;
 
-    assert!(!temp_dir.path().join(".config").join("gh").exists());
+    assert!(!gh_config_dir.exists());
 
     Ok(())
+}
+
+#[test]
+fn gh_config_dir_follows_gh_precedence() {
+    struct Case {
+        name: &'static str,
+        is_windows: bool,
+        env: Vec<(&'static str, &'static str)>,
+        expected: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "GH_CONFIG_DIR wins over everything",
+            is_windows: true,
+            env: vec![
+                ("GH_CONFIG_DIR", "/gh-config-dir"),
+                ("XDG_CONFIG_HOME", "/xdg"),
+                ("APPDATA", "/appdata"),
+            ],
+            expected: "/gh-config-dir",
+        },
+        Case {
+            name: "XDG_CONFIG_HOME wins over APPDATA",
+            is_windows: true,
+            env: vec![("XDG_CONFIG_HOME", "/xdg"), ("APPDATA", "/appdata")],
+            expected: "/xdg/gh",
+        },
+        Case {
+            name: "Windows uses APPDATA",
+            is_windows: true,
+            env: vec![("APPDATA", "/appdata")],
+            expected: "/appdata/GitHub CLI",
+        },
+        Case {
+            name: "other platforms ignore APPDATA",
+            is_windows: false,
+            env: vec![("APPDATA", "/appdata")],
+            expected: "/home/user/.config/gh",
+        },
+        Case {
+            name: "empty variables are treated as unset",
+            is_windows: true,
+            env: vec![
+                ("GH_CONFIG_DIR", ""),
+                ("XDG_CONFIG_HOME", ""),
+                ("APPDATA", ""),
+            ],
+            expected: "/home/user/.config/gh",
+        },
+        Case {
+            name: "nothing set falls back to the home directory",
+            is_windows: true,
+            env: vec![],
+            expected: "/home/user/.config/gh",
+        },
+    ];
+
+    for case in cases {
+        let resolved = resolve_gh_config_dir(Path::new("/home/user"), case.is_windows, |key| {
+            case.env
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(value))
+        });
+        assert_eq!(resolved, PathBuf::from(case.expected), "{}", case.name);
+    }
 }
 
 fn github_credential() -> GitCredential {
@@ -733,4 +1058,82 @@ fn refreshed_credentials_return_err_when_the_local_write_fails() {
     let message = format!("{error:#}");
     assert!(message.contains("Failed to write refreshed git credentials"));
     assert!(message.contains("github.com"));
+}
+
+#[test]
+fn git_home_dir_resolves_from_the_environment_in_git_order() -> Result<()> {
+    let existing_home = tempfile::tempdir()?;
+    let existing_home_path = existing_home.path().to_string_lossy().into_owned();
+    let missing_home_path = existing_home
+        .path()
+        .join("does-not-exist")
+        .to_string_lossy()
+        .into_owned();
+    // Splits a path into the non-empty drive and path halves whose concatenation is the original.
+    let split_drive = |path: &str| {
+        let (drive, rest) = path.split_at(1);
+        (drive.to_string(), rest.to_string())
+    };
+    let (existing_drive, existing_rest) = split_drive(&existing_home_path);
+    let (missing_drive, missing_rest) = split_drive(&missing_home_path);
+
+    struct Case {
+        name: &'static str,
+        env: Vec<(&'static str, String)>,
+        expected: Option<String>,
+    }
+    let cases = [
+        Case {
+            name: "HOME wins over every other variable",
+            env: vec![
+                ("HOME", "/from/home".to_string()),
+                ("HOMEDRIVE", existing_drive.clone()),
+                ("HOMEPATH", existing_rest.clone()),
+                ("USERPROFILE", "/from/userprofile".to_string()),
+            ],
+            expected: Some("/from/home".to_string()),
+        },
+        Case {
+            name: "an empty HOME is treated as unset",
+            env: vec![
+                ("HOME", String::new()),
+                ("USERPROFILE", "/from/userprofile".to_string()),
+            ],
+            expected: Some("/from/userprofile".to_string()),
+        },
+        Case {
+            name: "HOMEDRIVE and HOMEPATH win over USERPROFILE when the directory exists",
+            env: vec![
+                ("HOMEDRIVE", existing_drive),
+                ("HOMEPATH", existing_rest),
+                ("USERPROFILE", "/from/userprofile".to_string()),
+            ],
+            expected: Some(existing_home_path.clone()),
+        },
+        Case {
+            name: "a missing HOMEDRIVE and HOMEPATH directory falls back to USERPROFILE",
+            env: vec![
+                ("HOMEDRIVE", missing_drive),
+                ("HOMEPATH", missing_rest),
+                ("USERPROFILE", "/from/userprofile".to_string()),
+            ],
+            expected: Some("/from/userprofile".to_string()),
+        },
+        Case {
+            name: "nothing set resolves to nothing",
+            env: vec![],
+            expected: None,
+        },
+    ];
+
+    for case in cases {
+        let resolved = git_home_dir(|key| {
+            case.env
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(value))
+        });
+        assert_eq!(resolved, case.expected.map(PathBuf::from), "{}", case.name);
+    }
+    Ok(())
 }

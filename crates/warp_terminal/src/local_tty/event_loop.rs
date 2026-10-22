@@ -16,7 +16,7 @@ use mio::{self, Events, Interest};
 use parking_lot::{FairMutex, FairMutexGuard};
 
 use super::mio_channel::Receiver;
-use crate::event::ExitReason;
+use crate::event::{ExitReason, ObservedExitStatus};
 use crate::event_listener::ChannelEventListener;
 use crate::local_tty;
 use crate::model::ansi;
@@ -138,6 +138,7 @@ impl Writing {
 enum ChannelResult {
     Continue,
     TerminateLoop { child_exited: bool },
+    ReplaceShell,
 }
 
 impl<P, M> EventLoop<P, M>
@@ -174,6 +175,7 @@ where
                     };
                 }
                 Message::Resize(size) => self.pty.on_resize(&size),
+                Message::ShutdownForReplacement => return ChannelResult::ReplaceShell,
                 Message::ChildExited => return ChannelResult::TerminateLoop { child_exited: true },
             }
         }
@@ -325,7 +327,10 @@ where
         Ok(())
     }
 
-    pub fn spawn(mut self) -> JoinHandle<()> {
+    /// Runs the event loop on its own thread until the shell exits or a shutdown is requested.
+    /// The thread yields the loop's message receiver so the same channel can feed a replacement
+    /// event loop.
+    pub fn spawn(mut self) -> JoinHandle<Receiver<Message>> {
         #[cfg(test)]
         let feature_flag_overrides = warp_core::features::get_overrides();
 
@@ -363,6 +368,7 @@ where
                 // True if the child exiting caused the event loop to wind down
                 // (e.g. CTRL D or `exit`) rather than the inverse.
                 let mut child_exited = false;
+                let mut replacing_shell = false;
 
                 'event_loop: loop {
                     // Clear the events so that we can reliably equate the absence of events
@@ -398,13 +404,19 @@ where
                             token if token == CHANNEL_TOKEN => {
                                 match self.channel_event(&mut state) {
                                     ChannelResult::Continue => {}
+                                    ChannelResult::ReplaceShell => {
+                                        replacing_shell = true;
+                                        break 'event_loop;
+                                    }
                                     ChannelResult::TerminateLoop {
                                         child_exited: exited,
                                     } => {
                                         if exited {
-                                            self.terminal
-                                                .lock()
-                                                .exit(ExitReason::ShellProcessExited);
+                                            self.terminal.lock().exit(
+                                                ExitReason::ShellProcessExited {
+                                                    status: ObservedExitStatus::Unavailable,
+                                                },
+                                            );
                                             child_exited = true;
                                             self.event_listener.send_wakeup_event();
                                         }
@@ -414,10 +426,12 @@ where
                             }
 
                             token if token == self.pty.child_event_token() => {
-                                if let Some(local_tty::ChildEvent::Exited) =
+                                if let Some(local_tty::ChildEvent::Exited(status)) =
                                     self.pty.next_child_event()
                                 {
-                                    self.terminal.lock().exit(ExitReason::ShellProcessExited);
+                                    self.terminal
+                                        .lock()
+                                        .exit(ExitReason::ShellProcessExited { status });
                                     child_exited = true;
                                     self.event_listener.send_wakeup_event();
                                     break 'event_loop;
@@ -491,8 +505,10 @@ where
                         log::warn!("Failed to kill PTY process: {err:#}");
                     }
                 }
-                // Notify the terminal model that the PTY process has exited.
-                self.terminal.lock().exit(ExitReason::PtyDisconnected);
+                if !child_exited && !replacing_shell {
+                    self.terminal.lock().exit(ExitReason::PtyDisconnected);
+                }
+                self.rx
             })
             .expect("thread spawn works")
     }
