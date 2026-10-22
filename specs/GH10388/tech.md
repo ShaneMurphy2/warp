@@ -41,6 +41,12 @@ The prototype branch `gh-10388/hide-cursor-while-typing` already validated this 
    - Subscribe each `RootView` to `InputSettingsChangedEvent::HideCursorWhileTyping`.
    - On change, update that root view's platform window through `set_hide_cursor_while_typing`.
 
+## Risks and follow-ups
+
+The main risk is a regression in cursor restoration, text input, or hover behavior when using AppKit cursor hiding. The manual macOS checks below cover these interactions.
+
+No follow-up work is planned.
+
 ## Testing and validation
 
 Add a focused settings metadata test for default value, TOML path, public/private status, macOS-only support, and per-platform sync mode.
