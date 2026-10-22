@@ -61,5 +61,5 @@ Manual macOS validation:
 1. Default on: typing hides the cursor and mouse movement restores it.
 2. Toggle off: typing leaves the cursor visible.
 3. Toggle changes apply to existing windows without restart.
-4. Newly opened regular and Quake Mode windows use the current setting.
+4. With the setting both enabled and disabled, verify newly opened regular windows, restored windows, transferred windows, and Quake Mode windows use the current setting.
 5. Basic text input, IME/dead-key composition, selection, dragging, scrolling, and hover behavior still work.
